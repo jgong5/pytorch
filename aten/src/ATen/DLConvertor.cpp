@@ -40,7 +40,7 @@ DLDataType getDLDataType(const Tensor& t) {
       dtype.code = DLDataTypeCode::kDLUInt;
       break;
     case ScalarType::BFloat16:
-      throw std::logic_error("BFloat16 is not supported by dlpack");
+      dtype.code = DLDataTypeCode::kDLBfloat;
       break;
     case ScalarType::QInt8:
       throw std::logic_error("QInt8 is not supported by dlpack");
@@ -140,6 +140,16 @@ ScalarType toScalarType(const DLDataType& dtype) {
         default:
           throw std::logic_error(
               "Unsupported kFloat bits " + c10::to_string(dtype.bits));
+      }
+      break;
+    case DLDataTypeCode::kDLBfloat:
+      switch (dtype.bits) {
+        case 16:
+          stype = ScalarType::BFloat16;
+          break;
+        default:
+          throw std::logic_error(
+              "Unsupported kBfloat bits " + c10::to_string(dtype.bits));
       }
       break;
     default:
