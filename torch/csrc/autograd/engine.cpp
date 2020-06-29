@@ -107,7 +107,7 @@ struct ReadyQueue {
   // might set this to false.
   void push(NodeTask item, bool incrementOutstandingTasks = true);
   void pushShutdownTask();
-  NodeTask pop();
+  NodeTask pop(bool non_blocking = false);
   size_t size() const;
 };
 
@@ -215,9 +215,12 @@ size_t ReadyQueue::size() const {
   return heap_.size();
 }
 
-auto ReadyQueue::pop() -> NodeTask {
+auto ReadyQueue::pop(bool non_blocking) -> NodeTask {
   // Lock mutex for accesses to heap_
   std::unique_lock<std::mutex> lock(mutex_);
+  if (non_blocking && heap_.empty()) {
+    return NodeTask({}, nullptr, InputBuffer(0), /* isShutdownTask = */ true);
+  }
   not_empty_.wait(lock, [this]{ return !heap_.empty(); });
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   auto task = std::move(const_cast<NodeTask&>(heap_.top())); heap_.pop();
@@ -304,10 +307,11 @@ auto Engine::thread_init(int device) -> void {
 // in case this code is to be changed.
 auto Engine::thread_main(
     const std::shared_ptr<GraphTask>& graph_task,
-    bool reentrant_thread) -> void {
+    bool reentrant_thread,
+    bool sync_mode) -> void {
   // Either reentrant_thread should be false or we should pass in a non-null
   // graph_task.
-  TORCH_INTERNAL_ASSERT(reentrant_thread != (graph_task == nullptr));
+  TORCH_INTERNAL_ASSERT(reentrant_thread != (graph_task == nullptr) || sync_mode);
 
   auto queue = ready_queues_[worker_device + 1];
   // Why the test on graph_task->outstanding_tasks_?  See
@@ -321,7 +325,7 @@ auto Engine::thread_main(
       // Scope this block of execution since NodeTask is not needed after this
       // block and can be deallocated (release any references to grad tensors
       // as part of inputs_).
-      NodeTask task = queue->pop();
+      NodeTask task = queue->pop(/* non_blocking = */ sync_mode);
       // This will only work if the worker is running a non backward task
       // TODO Needs to be fixed this to work in all cases
       if (task.isShutdownTask_) {
@@ -770,6 +774,13 @@ std::shared_ptr<FutureVariableList> Engine::execute_with_graph_task(
   if (worker_device == NO_DEVICE) {
     // graph_task_exec_post_processing is done when the Future is marked as
     // completed in mark_graph_task_completed.
+    worker_device = -1;
+    while (!graph_task->future_result_->completed()) {
+      lock.unlock();
+      thread_main(graph_task, /* reentrant_thread */ false, /* sync_mode */ true);
+      lock.lock();
+    }
+    worker_device = NO_DEVICE;
     return graph_task->future_result_;
   } else {
     graph_task->owner_ = worker_device;
@@ -923,14 +934,15 @@ auto Engine::start_threads() -> void {
 
   // One for CPU, plus one for every GPU device (but colocate GPUs of different
   // types)
-  int num_threads = num_devices + 1;
+  int num_threads = num_devices;
   ready_queues_ = std::vector<std::shared_ptr<ReadyQueue>>(num_threads);
   for (auto& queue : ready_queues_)
     queue.reset(new ReadyQueue());
 
   thread_pool_shared_ = std::make_shared<ThreadPoolShared>();
 
-  for (int i = 0; i < num_threads; ++i) {
+  // We do sync-mode backward for CPU, so only create threads for GPUs (i >= 1)
+  for (int i = 1; i < num_threads; ++i) {
     std::thread t(&Engine::thread_init, this, i - 1);
     t.detach();
   }

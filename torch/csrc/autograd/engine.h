@@ -226,7 +226,8 @@ struct TORCH_API Engine {
       std::exception& e);
   virtual void thread_main(
       const std::shared_ptr<GraphTask>& task,
-      bool reentrant_thread);
+      bool reentrant_thread,
+      bool sync_mode = false);
   void reentrant_thread_init();
   void add_thread_pool_task(const std::weak_ptr<GraphTask>& graph_task);
   void set_device(int device);
