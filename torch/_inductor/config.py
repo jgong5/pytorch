@@ -79,10 +79,10 @@ class cpp:
     # performance degradation.
     dynamic_threads = False
 
-    simdlen = None
+    simdlen = 16
     min_chunk_size = 4096
     cxx = (
-        None,  # download gcc12 from conda-forge if conda is installed
+        #None,  # download gcc12 from conda-forge if conda is installed
         "g++-12",
         "g++-11",
         "g++-10",
