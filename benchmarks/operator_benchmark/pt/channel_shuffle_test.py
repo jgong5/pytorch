@@ -20,18 +20,28 @@ channel_shuffle_long_configs = op_bench.cross_product_configs(
 channel_shuffle_short_configs = op_bench.config_list(
     attr_names=["batch_size", "channels_per_group", "height", "width", "groups"],
     attrs=[
-        [2, 16, 16, 16, 2],
-        [2, 32, 32, 32, 2],
-        [4, 32, 32, 32, 4],
-        [4, 64, 64, 64, 4],
-        [8, 64, 64, 64, 8],
-        [16, 64, 64, 64, 16],
+        [64, 58, 28, 28, 2],
     ],
     cross_product_configs={
-        "channel_last": [True, False],
+        "channel_last": [True],
     },
     tags=["short"]
 )
+
+from torch import Tensor
+def channel_shuffle(x: Tensor, groups: int) -> Tensor:
+    batchsize, num_channels, height, width = x.size()
+    channels_per_group = num_channels // groups
+
+    # reshape
+    x = x.view(batchsize, groups, channels_per_group, height, width)
+
+    x = torch.transpose(x, 1, 2).contiguous()
+
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+
+    return x
 
 
 class ChannelSHuffleBenchmark(op_bench.TorchBenchmarkBase):
@@ -47,13 +57,32 @@ class ChannelSHuffleBenchmark(op_bench.TorchBenchmarkBase):
         }
         self.set_module_name('channel_shuffle')
 
-    def forward(self, input_data, groups: int):
-        return torch.channel_shuffle(input_data, groups)
+    def compute1(self, x1):
+        x1 += 1
+        return x1;
 
+    def compute2(self, x2):
+        x2 += 2
+        return x2;
+
+    def forward(self, input_data, groups: int):
+        x1, x2 = input_data.chunk(2, dim=1)
+        input_data = torch.cat([self.compute1(x1), self.compute2(x2)], dim=1)
+        return channel_shuffle(input_data, groups)
+
+class ChannelSHuffleBenchmarkTI(ChannelSHuffleBenchmark):
+    def init(self, batch_size, channels_per_group, height, width, groups, channel_last):
+        super().init(batch_size, channels_per_group, height, width, groups, channel_last)
+
+    @torch.compile()
+    def forward(self, input_data, groups: int):
+        return super().forward(input_data, groups)
 
 op_bench.generate_pt_test(channel_shuffle_short_configs + channel_shuffle_long_configs,
                           ChannelSHuffleBenchmark)
 
+op_bench.generate_pt_test(channel_shuffle_short_configs + channel_shuffle_long_configs,
+                          ChannelSHuffleBenchmarkTI)
 
 if __name__ == "__main__":
     op_bench.benchmark_runner.main()
