@@ -920,6 +920,8 @@ class CppTile2DKernel(CppVecKernel):
         assert new_index != expanded_index
 
         expr = f"TILE2D_LOAD(__place_holder__, {var} + {cexpr(new_index)}, {bias}, {self.simd_nelements}, float)"
+        if expr in self.cse.cache:
+            return self.cse.cache[expr]
         cse_var = self.cse.generate(self.loads, expr, write=False)
         expr = expr.replace("__place_holder__", str(cse_var))
         # TODO(jgong5): support other data types than float
@@ -1009,7 +1011,6 @@ class CppVecKernelChecker(CppVecKernel):
         self.exit_stack = contextlib.ExitStack()
 
         self.can_tile2d = True
-        self.has_inner_contiguous = False
         self.tile_outer_loop_level_idx = -1
 
     def could_vec(self, name: str, index: sympy.Expr):
@@ -1033,11 +1034,10 @@ class CppVecKernelChecker(CppVecKernel):
         for idx, itervar in enumerate(self.itervars[:-1]):
             if self.is_stride1_at(itervar, index):
                 # only support 2d tile now
-                if self.tile_outer_loop_level_idx >= 0:
+                if self.tile_outer_loop_level_idx >= 0 and self.tile_outer_loop_level_idx != idx:
                     self.can_tile2d = False
+                    return
                 self.tile_outer_loop_level_idx = idx
-        if self.is_stride1_at(self.itervars[-1], index):
-            self.has_inner_contiguous = True
 
     def load(self, name: str, index: sympy.Expr):
         self.check_can_tile2d(name, index)
