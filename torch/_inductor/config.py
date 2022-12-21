@@ -128,6 +128,7 @@ class cpp:
     enable_kernel_profile = False
     enable_tile2d = True
     ignore_tile2d_kernel = False
+    ignore_tile2d_tail_kernel = False
 
 
 # config specific to codegen/triton.py

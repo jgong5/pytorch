@@ -1450,12 +1450,15 @@ class CppKernelProxy(CppKernel):
                     if isinstance(kernel, CppTile2DTailKernel):
                         kernel.gen_inner_loop(code)
                     stack.enter_context(code.indent())
-                    if not config.cpp.ignore_tile2d_kernel:
+                    if config.cpp.ignore_tile2d_tail_kernel and isinstance(kernel, CppTile2DTailKernel):
+                        code.writeline("volatile int dummy = 0;")
+                    elif config.cpp.ignore_tile2d_kernel and isinstance(kernel, CppTile2DKernel):
+                        code.writeline("volatile int dummy = 0;")
+                    else:
                         code.splice(kernel.loads)
                         code.splice(kernel.compute)
                         code.splice(kernel.stores)
-                    else:
-                        code.writeline("volatile int dummy = 0;")
+                        
 
             def gen_loops(loops, body=None):
                 with contextlib.ExitStack() as stack:
