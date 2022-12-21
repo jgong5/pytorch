@@ -126,6 +126,7 @@ class cpp:
     )
     # Allow kernel performance profiling via PyTorch profiler
     enable_kernel_profile = False
+    enable_tile2d = True
 
 
 # config specific to codegen/triton.py
