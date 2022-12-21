@@ -285,9 +285,9 @@ inline void transpose_kernel_16x16_avx512(
   _mm512_storeu_ps(&dst[15 * ld_dst], p);
 }
 
-#define TILE2D_LOAD(dst, bias_var, tile_size, dtype)          \
+#define TILE2D_LOAD(dst, src, bias_var, tile_size, dtype)     \
   for (long bias_var = 0; bias_var < tile_size; bias_var++) { \
-    auto tmp = at::vec::Vectorized<dtype>::loadu(dst);        \
+    auto tmp = at::vec::Vectorized<dtype>::loadu(src);        \
     tmp.store(dst + bias_var*16);                             \
   }
 

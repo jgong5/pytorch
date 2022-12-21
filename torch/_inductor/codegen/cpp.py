@@ -584,7 +584,7 @@ class CppKernel(Kernel):
         #assert self.simd_nelements
         #assert self.simd_nelements >= 1
         var = self.itervars[itervar_idx]
-        replacement = {var: var * scale + bias if bias is not None else 0}
+        replacement = {var: var * scale + (bias if bias is not None else 0)}
         new_index = sympy_subs(expanded_index, replacement)
         return new_index
 
@@ -919,17 +919,18 @@ class CppTile2DKernel(CppVecKernel):
         new_index, contig_idx, non_contig_idx = self.transform_tile2d_index(expanded_index, bias)
         assert new_index != expanded_index
 
-        expr = f"TILE2D_LOAD({var} + {cexpr(new_index)}, {bias}, {self.simd_nelements}, float)"
+        expr = f"TILE2D_LOAD(__place_holder__, {var} + {cexpr(new_index)}, {bias}, {self.simd_nelements}, float)"
         cse_var = self.cse.generate(self.loads, expr, write=False)
+        expr = expr.replace("__place_holder__", str(cse_var))
         # TODO(jgong5): support other data types than float
         # TODO(jgong5): the following statement is too complex to handle by cse.generate
         #               maybe extending cse.generate to support the line below would be better?
-        line = f"float {var}[{self.simd_nelements}*{self.simd_nelements}] __attribute__ ((aligned (16))); {expr};"
+        line = f"float {cse_var}[{self.simd_nelements}*{self.simd_nelements}] __attribute__ ((aligned (16))); {expr};"
         V.kernel.current_node.codegen_originating_info(self.loads, only_once=True)
         self.loads.writeline(line)
 
         tile_meta = TileMeta(contig_idx, non_contig_idx)
-        self.tile_meta_cache[f"{cse_var}"] = tile_meta
+        self.tile_meta_cache[cse_var.name] = tile_meta
 
         return cse_var
 
@@ -943,12 +944,12 @@ class CppTile2DKernel(CppVecKernel):
 
         new_index, contig_idx, non_contig_idx = self.transform_tile2d_index(expanded_index)
         assert new_index != expanded_index
-        assert value in self.tile_meta_cache, value
-        tile_meta = self.tile_meta_cache[value]
+        assert str(value) in self.tile_meta_cache, value
+        tile_meta = self.tile_meta_cache[str(value)]
         # TODO(jgong5): cache the transposed result for multiple use
         # make sure we handle transposition here
-        assert tile_meta.contig_idx == non_contig_idx and tile_meta.non_contig_idx == contig_idx
-        line = f"TILE_STORE({var} + {cexpr(new_index)}, {value}, {self.stride_at(self.itervars[non_contig_idx], expanded_index)}, {self.simd_nelements});"
+        assert tile_meta[0] == non_contig_idx and tile_meta[1] == contig_idx
+        line = f"TILE2D_STORE({var} + {cexpr(new_index)}, {value}, {self.stride_at(self.itervars[non_contig_idx], expanded_index)}, {self.simd_nelements});"
         self.stores.writeline(name, line)
 
 
@@ -965,8 +966,8 @@ class CppTile2DTailKernel(CppKernel):
         return f"{self.itervars[-1]}_inner"
 
     def transform_tile2d_index_in_tail(self, index):
-        bias_outer = sympy.symbols(self.bias_outer_name)
-        bias_inner = sympy.symbols(self.bias_inner_name)
+        bias_outer = sympy.symbols(self.bias_outer_name())
+        bias_inner = sympy.symbols(self.bias_inner_name())
         new_index = self.scale_index_with_bias(index, self.simd_nelements, itervar_idx=-1, bias=bias_inner)
         new_index = self.scale_index_with_bias(new_index, self.simd_nelements, itervar_idx=self.tile_outer_loop_level_idx, bias=bias_outer)
         return new_index
@@ -985,13 +986,13 @@ class CppTile2DTailKernel(CppKernel):
         # TODO(jgong5): assert the index is an affine expression on the itervars in concern
         expanded_index = sympy.expand(index)
         new_index = self.transform_tile2d_index_in_tail(expanded_index)
-        super().store(self, name, new_index, value, mode)
+        super().store(name, new_index, value, mode)
 
     def gen_inner_loop(self, code):
-        outer = self.bias_outer_name
-        inner = self.bias_inner_name
-        code.writelines(f"for (long {outer} = 0; {outer} < {self.simd_nelements}; {outer}++")
-        code.writelines(f"for (long {inner} = 0; {inner} < {self.simd_nelements}; {inner}++")
+        outer = self.bias_outer_name()
+        inner = self.bias_inner_name()
+        code.writeline(f"for (long {outer} = 0; {outer} < {self.simd_nelements}; {outer}++)")
+        code.writeline(f"for (long {inner} = 0; {inner} < {self.simd_nelements}; {inner}++)")
 
 
 class CppVecKernelChecker(CppVecKernel):
@@ -1187,7 +1188,9 @@ class CppKernelProxy(CppKernel):
         self.tile2d_tail_kernel: CppTile2DKernel = None
         if len(kernels) > 1:
             if isinstance(kernels[1], tuple):
-                self.tile_outer_loop_level_idx, self.tile2d_kernel, self.tile2d_tail_kernel = kernels[1]
+                self.tile2d_kernel, self.tile2d_tail_kernel = kernels[1]
+                assert self.tile2d_kernel.tile_outer_loop_level_idx == self.tile2d_tail_kernel.tile_outer_loop_level_idx
+                self.tile_outer_loop_level_idx = self.tile2d_kernel.tile_outer_loop_level_idx
             else:
                 self.vec_kernel = kernels[1]
         self.picked_vec_isa: codecache.VecISA = codecache.pick_vec_isa()
@@ -1415,7 +1418,7 @@ class CppKernelProxy(CppKernel):
         assert self.tile2d_kernel.itervars == self.tile2d_tail_kernel.itervars == self.scalar_kernel.itervars
         assert self.tile2d_kernel.ranges == self.tile2d_tail_kernel.ranges == self.scalar_kernel.ranges
         assert len(self.tile2d_kernel.reduction_vars) == len(self.tile2d_tail_kernel.reduction_vars) == len(self.scalar_kernel.reduction_vars) == 0
-        assert self.tile2d_kernel.reduction_depth == self.tile2d_tail_kernel.reduction_depth == self.scalar_kernel.reduction_depth == 0
+        assert self.tile2d_kernel.reduction_depth == self.tile2d_tail_kernel.reduction_depth == self.scalar_kernel.reduction_depth == len(self.tile2d_kernel.itervars)
 
         itervars = self.tile2d_kernel.itervars
         rangs = self.tile2d_kernel.ranges
@@ -1432,9 +1435,11 @@ class CppKernelProxy(CppKernel):
                 metrics.generated_cpp_vec_kernel_count -= 1
                 return self.scalar_kernel.codegen_loops(code, worksharing)
 
-        par_depth = self.vec_kernel.decide_parallel_depth(
-            self.vec_kernel.call_ranges, threads
+        par_depth = self.tile2d_kernel.decide_parallel_depth(
+            self.tile2d_kernel.call_ranges, threads
         )
+        if par_depth:
+            par_depth = min(par_depth, self.tile_outer_loop_level_idx)
 
         with contextlib.ExitStack() as stack:
             if par_depth:
@@ -1456,23 +1461,32 @@ class CppKernelProxy(CppKernel):
                     code.splice(kernel.compute)
                     code.splice(kernel.stores)
 
-            def gen_loops(loops, body):
-                if not loops:
+            def gen_loops(loops, body=None):
+                with contextlib.ExitStack() as stack:
+                    for idx, loop in enumerate(loops):
+                        if isinstance(loop, LoopLevelWithTail):
+                            # main loop
+                            current_body = body
+                            if not current_body:
+                                current_body = loop.main_loop_body
+                                code.writelines(loop.main_loop.lines())
+                                with contextlib.ExitStack() as stack_inner:
+                                    stack_inner.enter_context(code.indent())
+                                    gen_loops(loops[idx+1:], current_body)
+                            # tail
+                            current_body = body
+                            if not current_body:
+                                current_body = loop.tail_loop_body
+                                code.writelines(loop.tail_loop.lines())
+                                with contextlib.ExitStack() as stack_inner:
+                                    stack_inner.enter_context(code.indent())
+                                    gen_loops(loops[idx+1:], current_body)
+                            if not body:
+                                return
+                        code.writelines(loop.lines())
+                        stack.enter_context(code.indent())
                     assert body
                     gen_loop_body(body)
-                    return
-                for idx, loop in enumerate(loops):
-                    code.writelines(loop.lines())
-                    stack.enter_context(code.indent())
-                    if isinstance(loop, LoopLevelWithTail):
-                        current_body = body
-                        if not current_body:
-                            current_body = loop.main_loop_body
-                            gen_loops(loops[idx+1:], current_body)
-                        current_body = body
-                        if not current_body:
-                            current_body = loop.tail_loop_body
-                            gen_loops(loops[idx+1:], current_body)
 
             gen_loops(non_reduce_loops)
 
@@ -1561,8 +1575,9 @@ class CppScheduling:
             if kernel_attr.can_vec:
                 kernels.append(create_kernel(CppKernelType.VECTOR))
             elif kernel_attr.can_tile2d:
-                kernels.append(create_kernel(CppKernelType.TILE2D, kernel_attr))
-                kernels.append(create_kernel(CppKernelType.TILE2D_TAIL, kernel_attr))
+                kernels.append(
+                    (create_kernel(CppKernelType.TILE2D, kernel_attr), create_kernel(CppKernelType.TILE2D_TAIL, kernel_attr))
+                )
         return kernels
         '''
         org_inplace_buffers_flag = config.inplace_buffers
@@ -1614,9 +1629,9 @@ class CppScheduling:
                     node.run(vars, ())
 
         kernel_attr.can_vec = codecache.pick_vec_isa() and kernel_checker.simd_vec
-        kernel_attr.can_tile2d = codecache.pick_vec_isa() and kernel_checker.can_tile2d
+        kernel_attr.can_tile2d = config.cpp.enable_tile2d and codecache.pick_vec_isa() and kernel_checker.can_tile2d
         kernel_attr.tile_outer_loop_level_idx = kernel_checker.tile_outer_loop_level_idx
-        kernel_attr.simd_nelements = codecache.pick_vec_isa().nelements if codecache.pick_vec_isa() else 1
+        kernel_attr.simd_nelements = codecache.pick_vec_isa().nelements() if codecache.pick_vec_isa() else 1
 
         return kernel_attr
 
@@ -1827,10 +1842,11 @@ class LoopLevel:
 
 
 class LoopLevelWithTail(LoopLevel):
-    def __init__(self, main_loop: LoopLevel, tail_loop: LoopLevel):
+    def __init__(self, main_loop: LoopLevel, tail_loop: LoopLevel, orig_loop: LoopLevel):
         super().__init__()
         self.main_loop = main_loop
         self.tail_loop = tail_loop
+        self.orig_loop = orig_loop
         # TODO(jgong5): here we assumed that the LoopLevelWithTail
         # only applies to the innermost loop level so it is a 1:1
         # mapping to the loop body while if we allow the split on
@@ -1840,7 +1856,8 @@ class LoopLevelWithTail(LoopLevel):
         self.tail_loop_body = None
 
     def lines(self):
-        raise AssertionError("Not Implemented")
+        #raise AssertionError("Not Implemented")
+        return self.orig_loop.lines()
 
 
 @dataclasses.dataclass
@@ -1888,7 +1905,7 @@ class LoopNest:
         tail_loop.collapsed = False
         tail_loop.reduction_vars = loop_to_split.reduction_vars
 
-        loop_with_tail = LoopLevelWithTail(main_loop, tail_loop)
+        loop_with_tail = LoopLevelWithTail(main_loop, tail_loop, loop_to_split)
         loop_with_tail.parallel = 0
         loop_with_tail.collapsed = False
 
