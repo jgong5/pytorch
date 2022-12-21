@@ -962,14 +962,9 @@ class CppTile2DTailKernel(CppKernel):
     def bias_outer_name(self):
         return f"{self.itervars[self.tile_outer_loop_level_idx]}_inner"
 
-    def bias_inner_name(self):
-        return f"{self.itervars[-1]}_inner"
-
     def transform_tile2d_index_in_tail(self, index):
         bias_outer = sympy.symbols(self.bias_outer_name())
-        bias_inner = sympy.symbols(self.bias_inner_name())
-        new_index = self.scale_index_with_bias(index, self.simd_nelements, itervar_idx=-1, bias=bias_inner)
-        new_index = self.scale_index_with_bias(new_index, self.simd_nelements, itervar_idx=self.tile_outer_loop_level_idx, bias=bias_outer)
+        new_index = self.scale_index_with_bias(index, self.simd_nelements, itervar_idx=self.tile_outer_loop_level_idx, bias=bias_outer)
         return new_index
 
     def load(self, name: str, index: sympy.Expr):
@@ -990,9 +985,7 @@ class CppTile2DTailKernel(CppKernel):
 
     def gen_inner_loop(self, code):
         outer = self.bias_outer_name()
-        inner = self.bias_inner_name()
         code.writeline(f"for (long {outer} = 0; {outer} < {self.simd_nelements}; {outer}++)")
-        code.writeline(f"for (long {inner} = 0; {inner} < {self.simd_nelements}; {inner}++)")
 
 
 class CppVecKernelChecker(CppVecKernel):
