@@ -66,8 +66,8 @@ class ChannelSHuffleBenchmark(op_bench.TorchBenchmarkBase):
         return x2;
 
     def forward(self, input_data, groups: int):
-        x1, x2 = input_data.chunk(2, dim=1)
-        input_data = torch.cat([self.compute1(x1), self.compute2(x2)], dim=1)
+        #x1, x2 = input_data.chunk(2, dim=1)
+        #input_data = torch.cat([self.compute1(x1), self.compute2(x2)], dim=1)
         return channel_shuffle(input_data, groups)
 
 class ChannelSHuffleBenchmarkTI(ChannelSHuffleBenchmark):
