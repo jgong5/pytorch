@@ -1190,6 +1190,141 @@ class CppVecKernel(CppKernel):
         self.cse.store_cache[name] = tmpvar
 
 
+@dataclasses.dataclass
+class TileMeta:
+    dtype: torch.dtype = torch.float32
+    ops: OpOverrides = None
+
+
+class CppTileCSEVariable(CSEVariable):
+    def __init__(self, name):
+        super().__init__(name)
+        self.meta = None
+
+    def update_on_args(self, name, args, kwargs):
+        self.meta = V.kernel.tile_meta()
+
+
+class CppTileOverrides(OpOverrides):
+    @staticmethod
+    def __getattr__(name):
+        def inner(*args, **kwargs):
+            meta = V.kernel.tile_meta()
+            # TODO: cse load
+            # declare
+            tile_var = V.kernel.cse.newvar()
+            V.kernel.compute.writeline(f"{DTYPE_TO_CPP[meta.dtype]} {tile_var}[{math.prod(V.kernel.tile_sizes)}];")
+            with V.kernel.inner_loops(V.kernel.compute):
+                result = getattr(meta.ops, name)(*args, **kwargs)
+                V.kernel.compute.writeline(f"{tile_var}[{cexpr(V.kernel.linear_tile_indexing())}] = {result};")
+            return tile_var
+
+        return inner
+
+
+class CppTileKernel(CppKernel):
+    """
+    A Cpp kernel that works on an n-dimensional tile with fixed sizes
+    """
+    overrides = CppTileOverrides
+
+    def __init__(self, args, num_threads, tile_sizes, loop_indices):
+        """
+        Construct the kernel handling tiles with sizes specified by `tile_sizes` on
+        loop levels specified by `loop_indices`.
+        """
+        super().__init__(args, num_threads)
+        assert len(tile_sizes) == len(loop_indices)
+        self.tile_sizes = tile_sizes
+        self.loop_indices = loop_indices
+
+    def inner_itervar(self, loop_idx):
+        return sympy.symbols(f"{self.itervars[loop_idx]}_inner")
+
+    @contextlib.contextmanager
+    def inner_loops(self, code, name=None):
+        if name:
+            writeline = functools.partial(code.writeline, name)
+        else:
+            writeline = code.writeline
+
+        @contextlib.contextmanager
+        def brace_indent():
+            writeline("{")
+            with code.indent():
+                yield
+            writeline("}")
+
+        with contextlib.ExitStack() as stack:
+            for i, loop_idx in enumerate(self.loop_indices):
+                loopvar = self.inner_itervar(loop_idx)
+                writeline(f"for (long {loopvar} = 0; {loopvar} < {self.tile_sizes[i]}); {loopvar}++) {{")
+                stack.enter_context(brace_indent())
+            yield
+
+    def linear_tile_indexing(self):
+        index = self.inner_itervar(self.loop_indices[-1])
+        for i, loop_idx in reversed(list(enumerate(self.loop_indices[:-1]))):
+            index += self.inner_itervar(loop_idx) * self.tile_size[i-1]
+        return index
+
+    def inner_transform_index(self, index):
+        expanded_index = sympy.expand(index)
+        new_index = expanded_index
+        for i, loop_idx in enumerate(self.loop_indices):
+            new_index = self.scale_index_with_offset(
+                new_index,
+                self.tile_sizes[i],
+                itervar_idx=loop_idx,
+                offset=self.inner_itervar(loop_idx),
+            )
+        return new_index
+
+    def tile_meta(self):
+        meta = TileMeta()
+        meta.dtype = torch.float32
+        meta.ops = CppOverrides(V.MockHandler())
+        return meta
+
+    def load(self, name: str, index: sympy.Expr):
+        var = self.args.input(name)
+        index = self.rename_indexing(index)
+        meta = self.tile_meta()
+        # declare
+        tile_var = self.cse.newvar()
+        self.loads.writeline(f"{DTYPE_TO_CPP[meta.dtype]} {tile_var}[{math.prod(self.tile_sizes)}];")
+        # define with naive inner loops
+        with self.inner_loops(self.loads):
+            # TODO: cse load
+            # TODO: generalize ops.load
+            loaded_var = super().load(name, self.inner_transform_index(index))
+            # meta.index has the linearized indexing into the tile slices it represents, renaming into
+            # the inner loop vars defined by the tile kernel.
+            self.loads.writeline(f"{tile_var}[{cexpr(self.linear_tile_indexing())}] = {loaded_var};")
+        tile_var.meta = meta
+        return tile_var
+         
+    def store(self, name, index, value, mode=None):
+        assert "buf" in name
+        index = self.rename_indexing(index)
+        assert isinstance(value, CppTileCSEVariable)
+        meta = value.meta
+        with self.inner_loops(self.stores, name):
+            value_slice = f"{value}[{cexpr(self.linear_tile_indexing())}]"
+            super().store(name, self.inner_transform_index(index), value_slice, mode)
+
+    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+        index = self.rename_indexing(index)
+        assert isinstance(value, CppTileCSEVariable)
+        meta = value.meta
+        with self.inner_loops(self.stores, name):
+            value_slice = f"{value}[{cexpr(self.linear_tile_indexing())}]"
+            super().reduction(name, dtype, src_dtype, reduction_type, self.inner_transform_index(index), value_slice)
+
+    def create_cse_var(self, *args, **kwargs):
+        return CppTileCSEVariable(*args, **kwargs)
+
+
 class CppTile2DKernel(CppVecKernel):
     """
     A vector kernel that handles the 2d tiles with the tile size defined in `tiling_factor` on
@@ -1893,7 +2028,7 @@ class CppKernelProxy(CppKernel):
                 main_loop, tail_loop = self.loop_nest.split_with_tiling(
                     inner_most_idx, factor=tiling_factor
                 )
-                main_loop.set_kernel(codegen_kernel(CppVecKernel, tiling_factor))
+                main_loop.set_kernel(codegen_kernel(CppTileKernel, [tiling_factor], [inner_most_idx]))
                 tail_loop.set_kernel(scalar_kernel)
                 main_loop.simd_vec = True
                 tail_loop.simd_omp = True
@@ -1914,10 +2049,10 @@ class CppKernelProxy(CppKernel):
                     inner_most_idx - outer_tiling_idx, factor=tiling_factor
                 )
                 inner_main_loop.set_kernel(
-                    codegen_kernel(CppTile2DKernel, tiling_factor, outer_tiling_idx)
+                    codegen_kernel(CppTileKernel, [tiling_factor, tiling_factor], [outer_tiling_idx, inner_most_idx])
                 )
                 inner_tail_loop.set_kernel(
-                    codegen_kernel(CppTile2DTailKernel, tiling_factor, outer_tiling_idx)
+                    codegen_kernel(CppTileKernel, [tiling_factor], [outer_tiling_idx])
                 )
 
     def codegen_loops(self, code, worksharing):
