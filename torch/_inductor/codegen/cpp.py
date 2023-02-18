@@ -1228,13 +1228,13 @@ class CppTileOverrides:
     @staticmethod
     def __getattr__(name):
         def inner(*args, **kwargs):
-            if V.kernel.in_tile_codegen:
+            if V.kernel.current_meta is not None:
                 return getattr(CppTileOverrides.cpp_ops, name)(*args, **kwargs)
             # TODO: support vec
             #V.kernel.compute.writeline(f"{DTYPE_TO_CPP[meta.dtype]} {tile_var}[{math.prod(V.kernel.tile_sizes)}];")
             slice_at = []
             meta = V.kernel.tile_meta(slice_at)
-            with V.kernel.tile_codegen_context("compute", meta):
+            with V.kernel.set_current_tile_meta(meta):
                 result = getattr(ops, name)(*args, **kwargs)
                 result.meta = meta
             return result
@@ -1279,13 +1279,13 @@ class CppTileKernel(CppKernel):
         assert len(tile_sizes) == len(loop_indices)
         self.tile_sizes = tile_sizes
         self.loop_indices = loop_indices
-        self.in_tile_codegen = False
         self.declares = IndentedBuffer()
         self.tile_loads = TileCodeGenBuffer()
         self.tile_compute = TileCodeGenBuffer()
         self.tile_stores = TileCodeGenBuffer()
         self.code = DeferredIndentedBuffer() # this overrides loads,compute,stores
         self.indent = 0
+        self.current_meta = None
 
     def inner_itervar(self, loop_idx):
         return sympy.symbols(f"{self.itervars[loop_idx]}_inner")
@@ -1303,56 +1303,19 @@ class CppTileKernel(CppKernel):
             )
         return new_index
 
-    @contextlib.contextmanager
-    def tile_codegen_context(self, code_type, meta):
-        class Wrapper:
-            def __init__(self, wrapped: TileCodeGenBuffer):
-                self.wrapped = wrapped
-
-            def __getattr__(self, item):
-                return getattr(self.wrapped, item)
-
-            def writeline(self, line):
-                self.wrapped.writeline(None, meta, line)
-
-            def writelines(self, lines):
-                self.wrapped.writelines(None, meta, lines)
-
-            def splice(self, code):
-                self.wrapped.splice(meta, code)
-
-        class DeferredWrapper:
-            def __init__(self, wrapped: TileCodeGenBuffer):
-                self.wrapped = wrapped
-
-            def __getattr__(self, item):
-                return getattr(self.wrapped, item)
-
-            def writeline(self, name, line):
-                self.wrapped.writeline(name, meta, line)
-
-            def writelines(self, name, lines):
-                self.wrapped.writelines(name, meta, lines)
-
-        with contextlib.ExitStack() as stack:
-            if code_type == "load":
-                stack.enter_context(self.swap_buffers(Wrapper(self.tile_loads)))
-            elif code_type == "store":
-                stack.enter_context(self.swap_buffers(Wrapper(self.tile_loads), cb=Wrapper(self.tile_loads), sb=DeferredWrapper(self.tile_stores)))
-            else:
-                assert code_type == "compute"
-                stack.enter_context(self.swap_buffers(Wrapper(self.tile_compute)))
-            old_in_tile_codegen = self.in_tile_codegen
-            self.in_tile_codegen = True
-            yield
-            self.in_tile_codegen = old_in_tile_codegen
-
     def tile_meta(self, slice_at, dtype=torch.float32):
         meta = TileMeta()
         meta.dtype = dtype
         meta.sizes = [self.tile_sizes[i] for i in slice_at]
         meta.indices = [self.loop_indices[i] for i in slice_at]
         return meta
+
+    @contextlib.contextmanager
+    def set_current_tile_meta(self, meta):
+        old_meta = self.current_meta
+        self.current_meta = meta
+        yield
+        self.current_meta = old_meta
 
     # TODO: remove
     def tile_indexing(self, meta, slice_meta=None):
@@ -1387,9 +1350,9 @@ class CppTileKernel(CppKernel):
         # TODO: support vec
         slice_at = []
         meta = self.tile_meta(slice_at) # TODO: dtype
-        with self.tile_codegen_context("load", meta):
+        # TODO: cse
+        with self.set_current_tile_meta(meta):
             new_index = self.inner_transform_index(index, meta)
-            # TODO: cse
             tile_var = CppKernel.load(self, name, new_index)
             tile_var.meta = meta
         return tile_var
@@ -1400,8 +1363,8 @@ class CppTileKernel(CppKernel):
         assert isinstance(value, CppTileCSEVariable)
         # TODO: support vec
         meta = value.meta
-        with self.tile_codegen_context("store", meta):
-            assert len(meta.sizes) == 0
+        assert len(meta.sizes) == 0
+        with self.set_current_tile_meta(meta):
             new_index = self.inner_transform_index(index, meta)
             CppKernel.store(self, name, new_index, value, mode)
 
@@ -1410,8 +1373,8 @@ class CppTileKernel(CppKernel):
         assert isinstance(value, CppTileCSEVariable)
         # TODO: support vec
         meta = value.meta
-        with self.tile_codegen_context("store", meta):
-            assert len(meta.sizes) == 0
+        assert len(meta.sizes) == 0
+        with self.set_current_tile_meta(meta):
             new_index = self.inner_transform_index(index, meta)
             CppKernel.reduction(self, name, dtype, src_dtype, reduction_type, new_index, value)
 
@@ -1419,7 +1382,45 @@ class CppTileKernel(CppKernel):
         return CppTileCSEVariable(*args, **kwargs)
 
     def __enter__(self):
-        return super().__enter__()
+        super().__enter__()
+        kernel = self
+        class Wrapper:
+            def __init__(self, wrapped: TileCodeGenBuffer):
+                self.wrapped = wrapped
+
+            def __getattr__(self, item):
+                return getattr(self.wrapped, item)
+
+            def writeline(self, line):
+                assert kernel.current_meta is not None
+                self.wrapped.writeline(None, kernel.current_meta, line)
+
+            def writelines(self, lines):
+                assert kernel.current_meta is not None
+                self.wrapped.writelines(None, kernel.current_meta, lines)
+
+            def splice(self, code):
+                assert kernel.current_meta is not None
+                self.wrapped.splice(kernel.current_meta, code)
+
+        class DeferredWrapper(Wrapper):
+            def __init__(self, wrapped: TileCodeGenBuffer):
+                super().__init__(wrapped)
+
+            def writeline(self, name, line):
+                assert kernel.current_meta is not None
+                self.wrapped.writeline(name, kernel.current_meta, line)
+
+            def writelines(self, name, lines):
+                assert kernel.current_meta is not None
+                self.wrapped.writelines(name, kernel.current_meta, lines)
+
+        self.exit_stack.enter_context(
+            self.swap_buffers(
+                Wrapper(self.tile_loads), cb=Wrapper(self.tile_compute), sb=DeferredWrapper(self.tile_stores)
+            )
+        )
+        return self
 
     def __exit__(self, *args):
 
