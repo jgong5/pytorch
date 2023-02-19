@@ -1200,13 +1200,13 @@ class CppVecKernel(CppKernel):
 @dataclasses.dataclass
 class TileMeta:
     dtype: torch.dtype = torch.float32
-    indices: list = None
+    slice_at: list = None
 
     # TODO: remove?
     def slice(self, slice_at):
         """ Create a TileMeta per `slice_at` sliced from self"""
         slice_meta = copy(self)
-        slice_meta.indices = slice_at
+        slice_meta.slice_at = slice_at
         return slice_meta
 
 
@@ -1237,7 +1237,7 @@ class CppTileOverrides:
             for arg in itertools.chain(args, kwargs.values()):
                 if isinstance(arg, CppTileCSEVariable):
                     meta = arg.meta
-                    new_slice_at = [i for i, loop_idx in enumerate(V.kernel.tile_loop_indices) if i in meta.indices]
+                    new_slice_at = [i for i, loop_idx in enumerate(V.kernel.tile_loop_indices) if i in meta.slice_at]
                     assert all([i in new_slice_at for i in slice_at]), f"new: {new_slice_at}, old: {slice_at}, {name} {args} {kwargs}"
                     slice_at = new_slice_at
             
@@ -1303,7 +1303,7 @@ class CppTileKernel(CppKernel):
     def inner_transform_index(self, index, meta):
         expanded_index = sympy.expand(index)
         new_index = expanded_index
-        loop_indices = [idx for i, idx in enumerate(self.tile_loop_indices) if i not in meta.indices]
+        loop_indices = [idx for i, idx in enumerate(self.tile_loop_indices) if i not in meta.slice_at]
         for idx in loop_indices:
             new_index = self.scale_index_with_offset(
                 new_index,
@@ -1317,23 +1317,23 @@ class CppTileKernel(CppKernel):
         meta = TileMeta()
         meta.dtype = dtype
         meta.sizes = [self.tile_sizes[i] for i in slice_at] # TODO: rmeove?
-        meta.indices = slice_at
+        meta.slice_at = slice_at
         return meta
 
     @contextlib.contextmanager
     def set_current_loop_indices_for(self, meta):
         old_indices = self.current_loop_indices
-        self.current_loop_indices = [idx for idx in self.tile_loop_indices if idx not in meta.indices]
+        self.current_loop_indices = [idx for idx in self.tile_loop_indices if idx not in meta.slice_at]
         yield
         self.current_loop_indices = old_indices
 
     # TODO: remove
     def tile_indexing(self, meta, slice_meta=None):
         index = 0
-        for i in reversed(meta.indices):
+        for i in reversed(meta.slice_at):
             loop_idx = self.tile_loop_indices[i]
             size = meta.sizes[i-1] if i > 0 else 1
-            if slice_meta is None or i in slice_meta.indices:
+            if slice_meta is None or i in slice_meta.slice_at:
                 index += self.inner_itervar(loop_idx) * size
             else:
                 index *= size
@@ -1382,12 +1382,12 @@ class CppTileKernel(CppKernel):
         # TODO: cse
         with self.set_current_loop_indices_for(meta):
             new_index = self.inner_transform_index(index, meta)
-            if len(meta.indices) == 0:
+            if len(meta.slice_at) == 0:
                 tile_var = CppKernel.load(self, name, new_index)
-            elif len(meta.indices) == 1:
+            elif len(meta.slice_at) == 1:
                 tile_var = CppVecKernel.load(self, name, new_index)
             else:
-                assert len(meta.indices) == 2
+                assert len(meta.slice_at) == 2
                 tile_var = self.tile_transpose2d_load(name, new_index)
             tile_var.meta = meta
         return tile_var
@@ -1399,12 +1399,12 @@ class CppTileKernel(CppKernel):
         out_slice_at = self.get_slice_at(index)
         out_meta = self.tile_meta(out_slice_at)
         meta = value.meta
-        assert meta.indices == out_meta.indices
+        assert meta.slice_at == out_meta.slice_at
         with self.set_current_loop_indices_for(meta):
             new_index = self.inner_transform_index(index, meta)
-            if len(meta.indices) == 0:
+            if len(meta.slice_at) == 0:
                 CppKernel.store(self, name, new_index, value, mode)
-            elif len(meta.indices) == 1:
+            elif len(meta.slice_at) == 1:
                 CppVecKernel.store(self, name, new_index, value, mode)
             else:
                 # TODO
@@ -1416,12 +1416,12 @@ class CppTileKernel(CppKernel):
         out_slice_at = self.get_slice_at(index)
         out_meta = self.tile_meta(out_slice_at)
         meta = value.meta
-        assert meta.indices == out_meta.indices
+        assert meta.slice_at == out_meta.slice_at
         with self.set_current_loop_indices_for(meta):
             new_index = self.inner_transform_index(index, meta)
-            if len(meta.indices) == 0:
+            if len(meta.slice_at) == 0:
                 CppKernel.reduction(self, name, dtype, src_dtype, reduction_type, new_index, value)
-            elif len(meta.indices) == 1:
+            elif len(meta.slice_at) == 1:
                 CppVecKernel.reduction(self, name, dtype, src_dtype, reduction_type, new_index, value)
             else:
                 # TODO
