@@ -1206,7 +1206,7 @@ class TileMeta:
     def slice(self, slice_at):
         """ Create a TileMeta per `slice_at` sliced from self"""
         slice_meta = copy(self)
-        slice_meta.indices = [self.indices[i] for i in slice_at]
+        slice_meta.indices = slice_at
         return slice_meta
 
 
@@ -1237,7 +1237,7 @@ class CppTileOverrides:
             for arg in itertools.chain(args, kwargs.values()):
                 if isinstance(arg, CppTileCSEVariable):
                     meta = arg.meta
-                    new_slice_at = [i for i, loop_idx in enumerate(V.kernel.tile_loop_indices) if loop_idx in meta.indices]
+                    new_slice_at = [i for i, loop_idx in enumerate(V.kernel.tile_loop_indices) if i in meta.indices]
                     assert all([i in new_slice_at for i in slice_at]), f"new: {new_slice_at}, old: {slice_at}, {name} {args} {kwargs}"
                     slice_at = new_slice_at
             
@@ -1303,7 +1303,7 @@ class CppTileKernel(CppKernel):
     def inner_transform_index(self, index, meta):
         expanded_index = sympy.expand(index)
         new_index = expanded_index
-        loop_indices = [idx for idx in self.tile_loop_indices if idx not in meta.indices]
+        loop_indices = [idx for i, idx in enumerate(self.tile_loop_indices) if i not in meta.indices]
         for idx in loop_indices:
             new_index = self.scale_index_with_offset(
                 new_index,
@@ -1317,7 +1317,7 @@ class CppTileKernel(CppKernel):
         meta = TileMeta()
         meta.dtype = dtype
         meta.sizes = [self.tile_sizes[i] for i in slice_at] # TODO: rmeove?
-        meta.indices = [self.tile_loop_indices[i] for i in slice_at]
+        meta.indices = slice_at
         return meta
 
     @contextlib.contextmanager
@@ -1330,9 +1330,10 @@ class CppTileKernel(CppKernel):
     # TODO: remove
     def tile_indexing(self, meta, slice_meta=None):
         index = 0
-        for i, loop_idx in reversed(list(enumerate(meta.indices))):
+        for i in reversed(meta.indices):
+            loop_idx = self.tile_loop_indices[i]
             size = meta.sizes[i-1] if i > 0 else 1
-            if slice_meta is None or loop_idx in slice_meta.indices:
+            if slice_meta is None or i in slice_meta.indices:
                 index += self.inner_itervar(loop_idx) * size
             else:
                 index *= size
