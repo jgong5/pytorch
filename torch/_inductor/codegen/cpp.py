@@ -1200,7 +1200,15 @@ class CppVecKernel(CppKernel):
 @dataclasses.dataclass
 class TileMeta:
     dtype: torch.dtype = torch.float32
+    indices: list = None
     slice_at: list = None
+    tile_var: "CppTileCSEVariable" = None # the original tile variable if this is a slice of it
+
+    def rank(self):
+        return len(self.indices)
+
+    def slice_rank(self):
+        return len(self.slice_at)
 
     # TODO: remove?
     def slice(self, slice_at):
@@ -1215,44 +1223,51 @@ class CppTileCSEVariable(CSEVariable):
         super().__init__(name)
         self.meta = None
 
+    def update_on_args(self, name, args, kwargs):
+        slice_at = list(range(len(V.kernel.tile_loop_indices)))
+        if V.kernel.compute_at is not None:
+            slice_at = [i for i in range(len(V.kernel.tile_loop_indices)) if i not in V.kernel.compute_at]
+        self.meta = V.kernel.tile_meta(slice_at) # TODO: dtype
 
 class CppTileOverrides:
     """A proxy that delegates the ops to those supported by CPP language and libraries"""
-    cpp_ops = CppOverrides(V.MockHandler())
-    cpp_vec_ops = CppVecOverrides(V.MockHandler())
-
     def __init__(self, parent):
         pass
 
     @staticmethod
     def __getattr__(name):
         def inner(*args, **kwargs):
-            if V.kernel.current_loop_indices is not None:
-                if len(V.kernel.current_loop_indices) == len(V.kernel.tile_loop_indices):
-                    return getattr(CppTileOverrides.cpp_ops, name)(*args, **kwargs)
-                elif len(V.kernel.tile_loop_indices) - len(V.kernel.current_loop_indices) == 1:
-                    return getattr(CppTileOverrides.cpp_vec_ops, name)(*args, **kwargs)
+            if V.kernel.compute_at is not None:
+                slice_rank = len(V.kernel.tile_loop_indices) - len(V.kernel.compute_at)
+                assert slice_rank in V.kernel.tile_compute_ops and hasattr(V.kernel.tile_compute_ops[slice_rank], name)
+                return getattr(V.kernel.tile_compute_ops[slice_rank], name)(*args, **kwargs)
+
             #V.kernel.compute.writeline(f"{DTYPE_TO_CPP[meta.dtype]} {tile_var}[{math.prod(V.kernel.tile_sizes)}];")
             slice_at = []
             for arg in itertools.chain(args, kwargs.values()):
                 if isinstance(arg, CppTileCSEVariable):
-                    meta = arg.meta
-                    new_slice_at = [i for i, loop_idx in enumerate(V.kernel.tile_loop_indices) if i in meta.slice_at]
-                    assert all([i in new_slice_at for i in slice_at]), f"new: {new_slice_at}, old: {slice_at}, {name} {args} {kwargs}"
-                    slice_at = new_slice_at
+                    if arg.meta.slice_rank() > len(slice_at):
+                        slice_at = arg.meta.slice_at
             
-            meta = V.kernel.tile_meta(slice_at)
-            with V.kernel.set_current_loop_indices_for(meta):
+            slice_rank = len(slice_at)
+            while slice_rank > 0:
+                if slice_rank in V.kernel.tile_compute_ops and hasattr(V.kernel.tile_compute_ops[slice_rank], name):
+                    break
+                slice_at = slice_at[1:]
+                slice_rank = len(slice_at)
+
+            with V.kernel.set_compute_at(slice_at):
+                new_args = [V.kernel.get_tile_slice(V.kernel.tile_broadcast(arg, slice_at), slice_at) if isinstance(arg, CppTileCSEVariable) else arg for arg in args]
+                new_kwargs = {k: V.kernel.get_tile_slice(V.kernel.tile_broadcast(v, slice_at), slice_at) if isinstance(v, CppTileCSEVariable) else v for k, v in kwargs}
                 result = getattr(ops, name)(*args, **kwargs)
-                result.meta = meta
             return result
 
         return inner
 
 
 class TileCodeOrLine:
-    def __init__(self, loop_indices, code_or_line, name=None):
-        self.loop_indices = loop_indices
+    def __init__(self, compute_at, code_or_line, name=None):
+        self.compute_at = compute_at
         self.code_or_line = code_or_line
         self.name = name
 
@@ -1261,15 +1276,15 @@ class TileCodeGenBuffer:
     def __init__(self):
         self.lines = []
 
-    def writeline(self, name, loop_indices, line):
-        self.lines.append(TileCodeOrLine(loop_indices, line, name))
+    def writeline(self, name, compute_at, line):
+        self.lines.append(TileCodeOrLine(compute_at, line, name))
 
-    def writelines(self, name, loop_indices, lines):
+    def writelines(self, name, compute_at, lines):
         for line in lines:
-            self.writeline(name, loop_indices, line)
+            self.writeline(name, compute_at, line)
 
-    def splice(self, loop_indices, code):
-        self.lines.append(TileCodeOrLine(loop_indices, code))
+    def splice(self, compute_at, code):
+        self.lines.append(TileCodeOrLine(compute_at, code))
 
 
 class CppTileKernel(CppKernel):
@@ -1293,17 +1308,37 @@ class CppTileKernel(CppKernel):
         self.tile_stores = TileCodeGenBuffer()
         self.code = DeferredIndentedBuffer() # this overrides loads,compute,stores
         self.indent = 0
-        self.current_loop_indices = None
+        self.compute_at = None
         self.tiling_factor = tile_sizes[0] # XXX: hack to get CppVecKernel work
         self.var_vec_buf_map = {} # XXX: hack to get CppVecKernel work
+        self.reduction_omp_dec = {} # XXX: hack to get CppVecKernel work
+
+        self.tile_load_ops = {}
+        self.tile_store_ops = {}
+        self.tile_reduction_ops = {}
+        self.tile_slice_ops = {}
+        self.tile_compute_ops = {}
+
+        self.init_tile_ops()
+
+    def init_tile_ops(self):
+        # TODO: support registration?
+        self.tile_load_ops[0] = functools.partial(CppKernel.load, self)
+        self.tile_load_ops[1] = functools.partial(CppVecKernel.load, self)
+        self.tile_store_ops[0] = functools.partial(CppKernel.store, self)
+        self.tile_store_ops[1] = functools.partial(CppVecKernel.store, self)
+        self.tile_reduction_ops[0] = functools.partial(CppKernel.reduction, self)
+        self.tile_reduction_ops[1] = functools.partial(CppVecKernel.reduction, self)
+        self.tile_compute_ops[0] = CppOverrides(V.MockHandler())
+        self.tile_compute_ops[1] = CppVecOverrides(V.MockHandler())
 
     def inner_itervar(self, loop_idx):
         return sympy.symbols(f"{self.itervars[loop_idx]}_inner")
 
-    def inner_transform_index(self, index, meta):
+    def inner_transform_index(self, index, slice_at):
         expanded_index = sympy.expand(index)
         new_index = expanded_index
-        loop_indices = [idx for i, idx in enumerate(self.tile_loop_indices) if i not in meta.slice_at]
+        loop_indices = [idx for i, idx in enumerate(self.tile_loop_indices) if i not in slice_at]
         for idx in loop_indices:
             new_index = self.scale_index_with_offset(
                 new_index,
@@ -1313,19 +1348,22 @@ class CppTileKernel(CppKernel):
             )
         return new_index
 
-    def tile_meta(self, slice_at, dtype=torch.float32):
+    def tile_meta(self, slice_at, indices=None, dtype=torch.float32):
         meta = TileMeta()
         meta.dtype = dtype
-        meta.sizes = [self.tile_sizes[i] for i in slice_at] # TODO: rmeove?
+        if indices is None:
+            meta.indices = list(range(len(self.tile_loop_indices)))
+        else:
+            meta.indices = indices
         meta.slice_at = slice_at
         return meta
 
     @contextlib.contextmanager
-    def set_current_loop_indices_for(self, meta):
-        old_indices = self.current_loop_indices
-        self.current_loop_indices = [idx for idx in self.tile_loop_indices if idx not in meta.slice_at]
+    def set_compute_at(self, slice_at):
+        old_indices = self.compute_at
+        self.compute_at = [i for i in range(len(self.tile_loop_indices)) if i not in slice_at]
         yield
-        self.current_loop_indices = old_indices
+        self.compute_at = old_indices
 
     # TODO: remove
     def tile_indexing(self, meta, slice_meta=None):
@@ -1346,7 +1384,7 @@ class CppTileKernel(CppKernel):
         self.loads.writeline(f"{tile_var}[{cexpr(self.tile_indexing(tile_var.meta, slice.meta))}] = {slice};")
 
     # TODO: remove
-    def tile_slice(self, tile_var, slice_at):
+    def tile_slice_xxx(self, tile_var, slice_at):
         """Slice a tile by `slice_at`"""
         # TODO: support vec
         meta = tile_var.meta
@@ -1367,65 +1405,73 @@ class CppTileKernel(CppKernel):
                 for loop_idx in self.tile_loop_indices[:-1]:
                     loop_var = self.itervars[loop_idx]
                     if self.is_stride1_at(loop_var, index):
-                        slice_at = [loop_idx, len(self.tile_loop_indices)-1]
+                        slice_at = [self.tile_loop_indices.index(loop_idx), len(self.tile_loop_indices)-1]
         return slice_at
 
-    def tile_transpose2d_load(self, index):
-        # TODO
-        assert False
+    def get_tile_slice(self, value, slice_at):
+        slice_rank = len(slice_at)
+        meta = value.meta
+        if meta.slice_rank() < slice_rank:
+            assert slice_rank in self.tile_slice_ops
+            value = self.tile_slice_ops[slice_rank](meta.tile_var, slice_at)
+        elif meta.slice_rank() > slice_rank:
+            assert slice_rank in self.tile_slice_ops
+            value = self.tile_slice_ops[slice_rank](value, slice_at)
+        else:
+            assert meta.slice_at == slice_at
+        return value
+
+    def tile_broadcast(self, var, slice_at):
+        if var.meta.rank() < len(slice_at):
+            # TODO: move this to op handler
+            assert var.meta.rank() == 0, "Expect only constant variable here"
+            assert len(slice_at) == 1, "Only support broadcast to a vector now"
+            return self.cse.generate(self.compute, f"at::vec::Vectorized<float>({var})")
+        return var
 
     def load(self, name: str, index: sympy.Expr):
         var = self.args.input(name)
         index = self.rename_indexing(index)
         slice_at = self.get_slice_at(index)
-        meta = self.tile_meta(slice_at) # TODO: dtype
+        slice_rank = len(slice_at)
+        assert slice_rank in self.tile_load_ops
+        tile_load_op = self.tile_load_ops[slice_rank]
         # TODO: cse
-        with self.set_current_loop_indices_for(meta):
-            new_index = self.inner_transform_index(index, meta)
-            if len(meta.slice_at) == 0:
-                tile_var = CppKernel.load(self, name, new_index)
-            elif len(meta.slice_at) == 1:
-                tile_var = CppVecKernel.load(self, name, new_index)
-            else:
-                assert len(meta.slice_at) == 2
-                tile_var = self.tile_transpose2d_load(name, new_index)
-            tile_var.meta = meta
+        with self.set_compute_at(slice_at):
+            new_index = self.inner_transform_index(index, slice_at)
+            tile_var = tile_load_op(name, new_index)
+            tile_var.update_on_args("load", name, index)
         return tile_var
 
     def store(self, name, index, value, mode=None):
         assert "buf" in name
         index = self.rename_indexing(index)
         assert isinstance(value, CppTileCSEVariable)
-        out_slice_at = self.get_slice_at(index)
-        out_meta = self.tile_meta(out_slice_at)
-        meta = value.meta
-        assert meta.slice_at == out_meta.slice_at
-        with self.set_current_loop_indices_for(meta):
-            new_index = self.inner_transform_index(index, meta)
-            if len(meta.slice_at) == 0:
-                CppKernel.store(self, name, new_index, value, mode)
-            elif len(meta.slice_at) == 1:
-                CppVecKernel.store(self, name, new_index, value, mode)
-            else:
-                # TODO
-                assert False
+        
+        slice_at = self.get_slice_at(index)
+        value = self.get_tile_slice(value, slice_at)
+
+        slice_rank = len(slice_at)
+        assert slice_rank in self.tile_store_ops
+        tile_store_op = self.tile_store_ops[slice_rank]
+        with self.set_compute_at(value.meta.slice_at):
+            new_index = self.inner_transform_index(index, value.meta.slice_at)
+            tile_store_op(name, new_index, value, mode)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
         index = self.rename_indexing(index)
         assert isinstance(value, CppTileCSEVariable)
-        out_slice_at = self.get_slice_at(index)
-        out_meta = self.tile_meta(out_slice_at)
-        meta = value.meta
-        assert meta.slice_at == out_meta.slice_at
-        with self.set_current_loop_indices_for(meta):
-            new_index = self.inner_transform_index(index, meta)
-            if len(meta.slice_at) == 0:
-                CppKernel.reduction(self, name, dtype, src_dtype, reduction_type, new_index, value)
-            elif len(meta.slice_at) == 1:
-                CppVecKernel.reduction(self, name, dtype, src_dtype, reduction_type, new_index, value)
-            else:
-                # TODO
-                assert False
+
+        slice_at = self.get_slice_at(index)
+        value = self.get_tile_slice(value, slice_at)
+
+        slice_rank = len(slice_at)
+        assert slice_rank in self.tile_reduction_ops
+        tile_reduction_op = self.tile_reduction_ops[slice_rank]
+
+        with self.set_compute_at(value.meta.slice_at):
+            new_index = self.inner_transform_index(index, value.meta.slice_at)
+            tile_reduction_op(name, dtype, src_dtype, reduction_type, index, value)
 
     def create_cse_var(self, *args, **kwargs):
         return CppTileCSEVariable(*args, **kwargs)
@@ -1441,28 +1487,28 @@ class CppTileKernel(CppKernel):
                 return getattr(self.wrapped, item)
 
             def writeline(self, line):
-                assert kernel.current_loop_indices is not None
-                self.wrapped.writeline(None, kernel.current_loop_indices, line)
+                assert kernel.compute_at is not None
+                self.wrapped.writeline(None, kernel.compute_at, line)
 
             def writelines(self, lines):
-                assert kernel.current_loop_indices is not None
-                self.wrapped.writelines(None, kernel.current_loop_indices, lines)
+                assert kernel.compute_at is not None
+                self.wrapped.writelines(None, kernel.compute_at, lines)
 
             def splice(self, code):
-                assert kernel.current_loop_indices is not None
-                self.wrapped.splice(kernel.current_loop_indices, code)
+                assert kernel.compute_at is not None
+                self.wrapped.splice(kernel.compute_at, code)
 
         class DeferredWrapper(Wrapper):
             def __init__(self, wrapped: TileCodeGenBuffer):
                 super().__init__(wrapped)
 
             def writeline(self, name, line):
-                assert kernel.current_loop_indices is not None
-                self.wrapped.writeline(name, kernel.current_loop_indices, line)
+                assert kernel.compute_at is not None
+                self.wrapped.writeline(name, kernel.compute_at, line)
 
             def writelines(self, name, lines):
-                assert kernel.current_loop_indices is not None
-                self.wrapped.writelines(name, kernel.current_loop_indices, lines)
+                assert kernel.compute_at is not None
+                self.wrapped.writelines(name, kernel.compute_at, lines)
 
         self.exit_stack.enter_context(
             self.swap_buffers(
@@ -1489,7 +1535,7 @@ class CppTileKernel(CppKernel):
         with patch.object(self.code, "prefix", lambda: prefix_override(self.code)):
             loop_indices = []
             for line in itertools.chain(self.tile_loads.lines, self.tile_compute.lines, self.tile_stores.lines):
-                new_loop_indices = line.loop_indices
+                new_loop_indices = [self.tile_loop_indices[i] for i in line.compute_at]
                 common_indices = [old for old, new in zip(loop_indices, new_loop_indices) if old == new]
 
                 for _ in loop_indices[len(common_indices):]:
