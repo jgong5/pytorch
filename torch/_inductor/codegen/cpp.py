@@ -1202,7 +1202,7 @@ class TileMeta:
     dtype: torch.dtype = torch.float32
     indices: list = None
     slice_at: list = None
-    tile_var: "CppTileCSEVariable" = None # the original tile variable if this is a slice of it
+    tile_buf: "CppTileCSEVariable" = None # the original tile buffer if this is a slice of it
 
     def rank(self):
         return len(self.indices)
@@ -1228,6 +1228,10 @@ class CppTileCSEVariable(CSEVariable):
         if V.kernel.compute_at is not None:
             slice_at = [i for i in range(len(V.kernel.tile_loop_indices)) if i not in V.kernel.compute_at]
         self.meta = V.kernel.tile_meta(slice_at) # TODO: dtype
+        if self.meta.slice_rank() < self.meta.rank():
+            tile_buf = V.kernel.tile_new_buf(self.meta.dtype)
+            V.kernel.tile_store(tile_buf, self)
+            self.meta.tile_buf = tile_buf
 
 class CppTileOverrides:
     """A proxy that delegates the ops to those supported by CPP language and libraries"""
@@ -1336,6 +1340,7 @@ class CppTileKernel(CppKernel):
         self.tile_reduction_ops[1] = functools.partial(CppVecKernel.reduction, self)
         self.tile_compute_ops[0] = CppOverrides(V.MockHandler())
         self.tile_compute_ops[1] = CppVecOverrides(V.MockHandler())
+        self.tile_slice_ops[1] = self.tile_slice
 
     def inner_itervar(self, loop_idx):
         return sympy.symbols(f"{self.itervars[loop_idx]}_inner")
@@ -1370,13 +1375,12 @@ class CppTileKernel(CppKernel):
         yield
         self.compute_at = old_indices
 
-    # TODO: remove
     def tile_indexing(self, meta, slice_meta=None):
         index = 0
         for i in reversed(meta.slice_at):
             loop_idx = self.tile_loop_indices[i]
-            size = meta.sizes[i-1] if i > 0 else 1
-            if slice_meta is None or i in slice_meta.slice_at:
+            size = self.tile_sizes[i-1] if i > 0 else 1
+            if slice_meta is None or i not in slice_meta.slice_at:
                 index += self.inner_itervar(loop_idx) * size
             else:
                 index *= size
@@ -1398,6 +1402,15 @@ class CppTileKernel(CppKernel):
         self.loads.writeline(f"auto {slice} = {tile_var}[{cexpr(self.tile_indexing(tile_var.meta, slice.meta))}];")
         return slice
 
+    def tile_new_buf(self, dtype):
+        tile_buf = self.cse.newvar()
+        self.declares.writeline(f"alignas(64) {DTYPE_TO_CPP[dtype]} {tile_buf}[{math.prod(self.tile_sizes)}];")
+        tile_buf.meta = self.tile_meta(list(range(len(self.tile_loop_indices))))
+        return tile_buf
+
+    def tile_store(self, tile_buf, slice):
+        self.compute.writeline(f"{tile_buf}[{cexpr(self.tile_indexing(tile_buf.meta, slice.meta))}] = {slice};")
+
     def get_slice_at(self, index):
         slice_at = []
         # indirect indexing, do scalar load, otherwise check vectorizable
@@ -1418,7 +1431,7 @@ class CppTileKernel(CppKernel):
         meta = value.meta
         if meta.slice_rank() < slice_rank:
             assert slice_rank in self.tile_slice_ops
-            value = self.tile_slice_ops[slice_rank](meta.tile_var, slice_at)
+            value = self.tile_slice_ops[slice_rank](meta.tile_buf, slice_at)
         elif meta.slice_rank() > slice_rank:
             assert slice_rank in self.tile_slice_ops
             value = self.tile_slice_ops[slice_rank](value, slice_at)
@@ -1433,6 +1446,16 @@ class CppTileKernel(CppKernel):
             assert len(slice_at) == 1, "Only support broadcast to a vector now"
             return self.cse.generate(self.compute, f"at::vec::Vectorized<float>({var})")
         return var
+
+    def tile_slice(self, tile_var, slice_at):
+        slice_rank = len(slice_at)
+        if tile_var.meta.slice_rank() == slice_rank:
+            return tile_var
+        assert tile_var.meta.slice_rank() > slice_rank
+        assert slice_rank == 0, "only support scalar slicing right now"
+        slice = self.cse.generate(self.compute, f"{tile_var}[{cexpr(self.tile_indexing(tile_var.meta, slice.meta))}]")
+        slice.meta = self.tile_meta([], tile_var.indices) # TODO: support vec
+        return slice
 
     def load(self, name: str, index: sympy.Expr):
         var = self.args.input(name)
@@ -2287,10 +2310,12 @@ class CppKernelProxy(CppKernel):
                     inner_most_idx - outer_tiling_idx, factor=tiling_factor
                 )
                 inner_main_loop.set_kernel(
-                    codegen_kernel(CppTileKernel, [tiling_factor, tiling_factor], [outer_tiling_idx, inner_most_idx])
+                    #codegen_kernel(CppTileKernel, [tiling_factor, tiling_factor], [outer_tiling_idx, inner_most_idx])
+                    codegen_kernel(CppTile2DKernel, tiling_factor, outer_tiling_idx)
                 )
                 inner_tail_loop.set_kernel(
                     codegen_kernel(CppTileKernel, [tiling_factor], [outer_tiling_idx])
+                    #codegen_kernel(CppTile2DTailKernel, tiling_factor, outer_tiling_idx)
                 )
 
     def codegen_loops(self, code, worksharing):
