@@ -1093,13 +1093,14 @@ class CppVecKernel(CppKernel):
         self.reduction_omp_dec: Dict[str, str] = {}
         self.var_vec_buf_map: Dict[str, str] = {}
         metrics.generated_cpp_vec_kernel_count += 1
+        self.vec_itervar_idx = -1 # XXX: hack to make tile work
 
     def load(self, name: str, index: sympy.Expr):
         var = self.args.input(name)
         index = self.rename_indexing(index)
 
         expanded_index = sympy.expand(index)
-        new_index = self.scale_index_with_offset(index, self.tiling_factor)
+        new_index = self.scale_index_with_offset(index, self.tiling_factor, itervar_idx=self.vec_itervar_idx)
 
         is_broadcast = expanded_index == new_index
 
@@ -1132,7 +1133,7 @@ class CppVecKernel(CppKernel):
         assert mode is None
 
         expanded_index = sympy.expand(index)
-        new_index = self.scale_index_with_offset(index, self.tiling_factor)
+        new_index = self.scale_index_with_offset(index, self.tiling_factor, itervar_idx=self.vec_itervar_idx)
         assert new_index != expanded_index
         line = f"{value}.store({var} + {cexpr(new_index)});"
         self.stores.writeline(name, line)
@@ -1339,6 +1340,7 @@ class CppTileKernel(CppKernel):
         self.need_vec_transpose = functools.partial(CppTile2DKernel.need_vec_transpose, self) # XXX: hack to get CppTile2DKernel work
         self.gen_transposed_tile_load_store = functools.partial(CppTile2DKernel.gen_transposed_tile_load_store, self) # XXX: hack to get CppTile2DKernel work
         self.outer_tiling_idx = self.tile_loop_indices[0] # XXX: hack to get CppTile2DKernel work
+        self.vec_itervar_idx = self.tile_loop_indices[-1] # XXX: hack to get CppVecKernel work
         metrics.generated_cpp_vec_kernel_count += 1 # XXX: make test pass
 
         self.tile_load_ops = {}
