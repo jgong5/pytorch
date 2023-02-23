@@ -1233,13 +1233,15 @@ class CppTileCSEVariable(CSEVariable):
         # but a tile can be invariant under some dims and can be stored to a buffer
         # with a smaller rank, e.g., a scalar only needs a 0-rank buffer.
         if self.meta.rank() < V.kernel.tile_rank():
-            with contextlib.ExitStack() as stack:
-                if name == "load":
-                    stack.enter_context(V.kernel.swap_buffers(V.kernel.loads, cb=V.kernel.loads))
-                tile_buf = V.kernel.tile_new_buf(self.meta.dtype)
-                V.kernel.tile_store(tile_buf, self)
-                self.meta.tile_buf = tile_buf
+            self.define_tile_buf(V.kernel.loads if name == "load" else None)
 
+    def define_tile_buf(self, code=None):
+        with contextlib.ExitStack() as stack:
+            if code is not None:
+                stack.enter_context(V.kernel.swap_buffers(code, cb=code, sb=code))
+            tile_buf = V.kernel.tile_new_buf(self.meta.dtype)
+            V.kernel.tile_store(tile_buf, self)
+            self.meta.tile_buf = tile_buf
 
 class CppTileOverrides:
     """A proxy that delegates the ops to those supported by CPP language and libraries"""
@@ -1363,6 +1365,7 @@ class CppTileKernel(CppKernel):
         self.tile_reduction_ops[1] = functools.partial(CppVecKernel.reduction, self)
         self.tile_compute_ops[0] = CppOverrides(V.MockHandler())
         self.tile_compute_ops[1] = CppVecOverrides(V.MockHandler())
+        self.tile_slice_ops[0] = self.tile_slice
         self.tile_slice_ops[1] = self.tile_slice
         self.tile_slice_ops[2] = self.tile_slice
 
@@ -1444,8 +1447,12 @@ class CppTileKernel(CppKernel):
     def get_tile_slice(self, value, slice_indices):
         slice_rank = len(slice_indices)
         meta = value.meta
-        if meta.rank() < slice_rank:
+        if meta.rank() == slice_rank:
+            return value
+        if meta.rank() < slice_rank or meta.in_register:
             assert slice_rank in self.tile_slice_ops, slice_rank
+            if meta.in_register and meta.tile_buf is None:
+                value.define_tile_buf()
             value = self.tile_slice_ops[slice_rank](meta.tile_buf, slice_indices)
         elif meta.rank() > slice_rank:
             assert slice_rank in self.tile_slice_ops, slice_rank
@@ -1486,7 +1493,8 @@ class CppTileKernel(CppKernel):
         ld_dst = f"{factor}"
 
         need_define = True
-        load_or_store = f"([&]() {{ alignas(64) std::array<float,{factor}> {dst}; at::vec::transpose_mxn<float,{factor},{factor}>({src}, {ld_src}, &{dst}[0], {ld_dst}); return tmp; }})()"
+        # TODO: use values from tile_sizes instead
+        load_or_store = f"([&]() {{ alignas(64) std::array<float,{factor*factor}> {dst}; at::vec::transpose_mxn<float,{factor},{factor}>({src}, {ld_src}, &{dst}[0], {ld_dst}); return tmp; }})()"
         tile_var = self.cse.generate(self.loads, load_or_store)
         return tile_var
 
@@ -1528,13 +1536,12 @@ class CppTileKernel(CppKernel):
         assert isinstance(value, CppTileCSEVariable)
 
         tile_indices = self.get_tile_indices(index)
-        value = self.get_tile_slice(value, tile_indices)
-
         tile_rank = len(tile_indices)
         assert tile_rank in self.tile_store_ops
         tile_store_op = self.tile_store_ops[tile_rank]
-        with self.set_compute_at(value.meta.indices):
-            new_index = self.inner_transform_index(index, value.meta.indices)
+        with self.set_compute_at(tile_indices):
+            new_index = self.inner_transform_index(index, tile_indices)
+            value = self.get_tile_slice(value, tile_indices)
             tile_store_op(name, new_index, value, mode)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):

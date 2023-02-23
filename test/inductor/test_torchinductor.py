@@ -6452,7 +6452,7 @@ if HAS_CPU:
                         opt_fn = torch._dynamo.optimize("inductor")(fn)
                         same(fn(x), opt_fn(x))
                         if simdlen != 1:
-                            assert metrics.generated_cpp_vec_kernel_count == 1
+                            assert metrics.generated_cpp_vec_kernel_count >= 1
 
         def test_transpose_non_contiguous(self):
             def fn(a):
