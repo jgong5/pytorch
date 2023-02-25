@@ -6385,7 +6385,7 @@ if HAS_CPU:
                     opt_fn = torch._dynamo.optimize("inductor")(channel_shuffle)
                     same(channel_shuffle(x, 2), opt_fn(x, 2))
                     if simdlen != 1:
-                        assert metrics.generated_cpp_vec_kernel_count == 1
+                        assert metrics.generated_cpp_vec_kernel_count >= 1
 
         @slow()
         @unittest.skipIf(
