@@ -1285,7 +1285,7 @@ class CppTile1DOverrides(CppVecOverrides):
             self.vec_itervar_idx = vec_itervar_idx
             value = self.tile_slice(value, self.current_tile_indices)
             assert value.meta.rank() == 1
-            CppVecKernel.store(V.kernel, name, index, value, mode)
+            return CppVecKernel.store(V.kernel, name, index, value, mode)
         raise NotImplementedError
 
     @staticmethod
@@ -1294,7 +1294,7 @@ class CppTile1DOverrides(CppVecOverrides):
         vec_itervar_idx = CppTile1DOverrides._get_vec_itervar_idx(index)
         if vec_itervar_idx >= 0:
             self.vec_itervar_idx = vec_itervar_idx
-            CppVecKernel.reduction(V.kernel, name, dtype, src_dtype, reduction_type, index, value)
+            return CppVecKernel.reduction(V.kernel, name, dtype, src_dtype, reduction_type, index, value)
         raise NotImplementedError
 
     @staticmethod
@@ -1422,7 +1422,7 @@ class CppTileFallbackOverrides:
                     index_arg_id = 1
                 elif name == "reduction":
                     index_arg_id = 4
-                new_args = [self.inner_transform_index(args[index_arg_id], [tile_index]) if i == index_arg_id else arg for i, arg in enumerate(args)]
+                new_args = [self.inner_transform_index(args[index_arg_id], self.current_tile_indices) if i == index_arg_id else arg for i, arg in enumerate(args)]
                 return getattr(ops, name)(*new_args, **kwargs)
             
         return inner
@@ -1503,7 +1503,7 @@ class CppTileKernel(CppKernel):
         self.tile_stores = TileCodeGenBuffer()
         self.code = DeferredIndentedBuffer() # this overrides loads,compute,stores
         self.indent = 0 # indention of `self.code`
-        self.current_tile_indices = loop_indices
+        self.current_tile_indices = list(range(self.tile_rank()))
 
         self.tiling_factor = tile_sizes[0] # XXX: hack to get CppVecKernel work
         self.var_vec_buf_map = {} # XXX: hack to get CppVecKernel work
@@ -1566,6 +1566,8 @@ class CppTileKernel(CppKernel):
 
     def define_tile_buf(self, value, code=None):
         with contextlib.ExitStack() as stack:
+            if value.meta.tile_buf is not None:
+                return value.meta.tile_buf
             if code is not None:
                 stack.enter_context(self.swap_buffers(code, cb=code, sb=code))
             tile_buf = self.tile_new_buf(value.meta.dtype)
@@ -1655,7 +1657,7 @@ class CppTileKernel(CppKernel):
                             dtype = opt_ctx.dtype
                         result.meta = TileMeta(indices=V.kernel.current_tile_indices, dtype=dtype)
                         if result.meta.rank() > 1:
-                            self.meta.in_register = False
+                            result.meta.in_register = False
                         # TODO: we always store to the full-rank tile buffer now for simplicity
                         # but a tile can be invariant under some dims and can be stored to a buffer
                         # with a smaller rank, e.g., a scalar only needs a 0-rank buffer.
