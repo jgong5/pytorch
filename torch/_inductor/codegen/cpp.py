@@ -1450,8 +1450,11 @@ class CppTileFallbackWrapper(V.WrapperHandler):
         return inner
 
 
-class CppTileOverrides(OpOverrides):
+class CppTileOverrides:
     """A proxy that delegates the ops to those supported by CPP language and libraries"""
+
+    def __init__(self, parent):
+        pass
 
     def __getattr__(self, name):
         def inner(*args, **kwargs):
