@@ -1216,38 +1216,6 @@ class CppTileCSEVariable(CSEVariable):
         super().__init__(name)
         self.meta = None
 
-    def update_on_args(self, name, args, kwargs):
-        if self.meta is not None:
-            return
-        tile_indices = list(range(V.kernel.tile_rank()))
-        # TODO: we need an op override specific meta annotator instead of
-        # hard-coding the tile rank according to the inner loops under which
-        # it is defined.
-        if V.kernel.compute_at is not None:
-            tile_indices = [i for i in range(len(V.kernel.tile_loop_indices)) if i not in V.kernel.compute_at]
-        opt_ctx: OptimizationContext = get_current_node_opt_ctx()
-        dtype = torch.float32
-        if opt_ctx is not None:
-            dtype = opt_ctx.dtype
-        self.meta = TileMeta(indices=tile_indices, dtype=dtype)
-        # TODO: put this to ops override
-        if self.meta.rank() > 1:
-            self.meta.in_register = False
-        # TODO: we always store to the full-rank tile buffer now for simplicity
-        # but a tile can be invariant under some dims and can be stored to a buffer
-        # with a smaller rank, e.g., a scalar only needs a 0-rank buffer.
-        if self.meta.rank() < V.kernel.tile_rank():
-            self.define_tile_buf(V.kernel.loads if name == "load" else None)
-
-    def define_tile_buf(self, code=None):
-        with contextlib.ExitStack() as stack:
-            if code is not None:
-                stack.enter_context(V.kernel.swap_buffers(code, cb=code, sb=code))
-            tile_buf = V.kernel.tile_new_buf(self.meta.dtype)
-            ops.tile_store(tile_buf, self)
-            self.meta.tile_buf = tile_buf
-            return tile_buf
-
 
 class CppTile0DOverrides(CppOverrides):
 
@@ -1597,13 +1565,22 @@ class CppTileKernel(CppKernel):
         tile_buf.meta = TileMeta(indices = list(range(len(self.tile_loop_indices))), dtype=dtype, in_register=False)
         return tile_buf
 
+    def define_tile_buf(self, value, code=None):
+        with contextlib.ExitStack() as stack:
+            if code is not None:
+                stack.enter_context(self.swap_buffers(code, cb=code, sb=code))
+            tile_buf = self.tile_new_buf(value.meta.dtype)
+            ops.tile_store(tile_buf, value)
+            value.meta.tile_buf = tile_buf
+            return tile_buf
+
     def tile_slice(self, value, slice_indices):
         slice_rank = len(slice_indices)
         meta = value.meta
         if meta.rank() == slice_rank:
             return value
         if meta.in_register:
-            value = value.define_tile_buf()
+            value = self.define_tile_buf(value)
         return ops.tile_slice(value, slice_indices)
 
     def tile_ops(self):
@@ -1669,6 +1646,31 @@ class CppTileKernel(CppKernel):
                 Wrapper(self.tile_loads), cb=Wrapper(self.tile_compute), sb=DeferredWrapper(self.tile_stores)
             )
         )
+
+        class TileMetaAnnotator(V.WrapperHandler):
+
+            def __getattr__(self, name):
+                def inner(*args, **kwargs):
+                    result = getattr(self._inner)(*args, **kwargs)
+                    if isinstance(result, CppTileCSEVariable) and result.meta is None:
+                        opt_ctx: OptimizationContext = get_current_node_opt_ctx()
+                        dtype = torch.float32
+                        if opt_ctx is not None:
+                            dtype = opt_ctx.dtype
+                        result.meta = TileMeta(indices=V.kernel.current_tile_indices, dtype=dtype)
+                        if result.meta.rank() > 1:
+                            self.meta.in_register = False
+                        # TODO: we always store to the full-rank tile buffer now for simplicity
+                        # but a tile can be invariant under some dims and can be stored to a buffer
+                        # with a smaller rank, e.g., a scalar only needs a 0-rank buffer.
+                        if result.meta.rank() < V.kernel.tile_rank():
+                            V.kernel.define_tile_buf(result, V.kernel.loads if name == "load" else None)
+                    return result
+                
+                return inner
+
+        self.exit_stack.enter_context(V.set_ops_handler(TileMetaAnnotator(V.get_ops_handler())))
+
         return self
 
     def __exit__(self, *args):
