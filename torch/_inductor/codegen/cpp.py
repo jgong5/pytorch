@@ -1225,24 +1225,27 @@ class CppTile0DOverrides(CppOverrides):
     
     @staticmethod
     def store(name, index, value, mode=None):
+        value = V.kernel.tile_slice(value, [])
         CppKernel.store(V.kernel, name, index, value, mode)
 
     @staticmethod
     def reduction(name, dtype, src_dtype, reduction_type, index, value):
+        value = V.kernel.tile_slice(value, [])
         CppKernel.reduction(V.kernel, name, dtype, src_dtype, reduction_type, index, value)
 
     @staticmethod
     def tile_slice(tile_var, slice_indices):
         assert isinstance(tile_var, CppTileCSEVariable)
-        assert not tile_var.meta.in_register
         assert len(slice_indices) == 0
 
         if tile_var.meta.rank() == 0:
             return tile_var
+
+        assert not tile_var.meta.in_register
         assert tile_var.meta.rank() > 0
         
         # TODO: handle the meta annotation in a common class
-        slice_meta = TileMeta(dtype=tile_var.dtype, indices=[])
+        slice_meta = TileMeta(dtype=tile_var.meta.dtype, indices=[])
         slice = V.kernel.cse.generate(V.kernel.compute, f"{tile_var}[{cexpr(V.kernel.tile_indexing(tile_var.meta, slice_meta))}] /* slice */")
         slice.meta = slice_meta
         return slice
@@ -1294,6 +1297,8 @@ class CppTile1DOverrides(CppVecOverrides):
         vec_itervar_idx = CppTile1DOverrides._get_vec_itervar_idx(index)
         if vec_itervar_idx >= 0:
             self.vec_itervar_idx = vec_itervar_idx
+            value = self.tile_slice(value, self.current_tile_indices)
+            assert value.meta.rank() == 1
             return CppVecKernel.reduction(V.kernel, name, dtype, src_dtype, reduction_type, index, value)
         raise NotImplementedError
 
@@ -1547,6 +1552,13 @@ class CppTileKernel(CppKernel):
         yield
         self.current_tile_indices = old_tile_indices
 
+    @contextlib.contextmanager
+    def set_current_tile_indices(self, indices):
+        old_tile_indices = self.current_tile_indices
+        self.current_tile_indices = indices
+        yield
+        self.current_tile_indices = old_tile_indices
+
     def current_tile_rank(self):
         return len(self.current_tile_indices)
 
@@ -1574,6 +1586,8 @@ class CppTileKernel(CppKernel):
             if code is not None:
                 stack.enter_context(self.swap_buffers(code, cb=code, sb=code))
             tile_buf = self.tile_new_buf(value.meta.dtype)
+            if self.current_tile_rank() != value.meta.rank():
+                stack.enter_context(self.set_current_tile_indices(value.meta.indices))
             ops.tile_store(tile_buf, value)
             value.meta.tile_buf = tile_buf
             return tile_buf
