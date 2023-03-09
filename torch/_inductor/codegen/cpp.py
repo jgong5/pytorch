@@ -1109,28 +1109,132 @@ class CppKernel(Kernel):
         (self.loads, self.compute, self.stores, self.cse) = prior
 
 
-class CppVecKernel(CppKernel):
-    overrides = CppVecOverrides
+@dataclasses.dataclass
+class TileMeta:
+    """
+    Metadata describing an N-dim tile variable of fixed sizes.
+    Tile variables are valid within the scope of CppTileKernel. The tile
+    variable defines the dim mapping from `indices` attribute to the
+    `CppTileKernel.tile_loop_indices` indicating the kernel itervars to apply tiling.
+    """
 
-    def __init__(self, args, num_threads, tiling_factor=0):
-        super().__init__(args, num_threads)
-        assert codecache.pick_vec_isa()
-        if tiling_factor == 0:
-            tiling_factor = codecache.pick_vec_isa().nelements()
-        self.tiling_factor = tiling_factor
-        self.reduction_omp_dec: Dict[str, str] = {}
-        self.var_vec_buf_map: Dict[str, str] = {}
-        metrics.generated_cpp_vec_kernel_count += 1
-        # TODO(jgong5): hack to make tile work, will be cleaned up later
-        self.vec_itervar_idx = -1
+    dtype: torch.dtype = torch.float32
 
-    def load(self, name: str, index: sympy.Expr):
+    # indices into tile_loop_indices of the CppTileKernel. This decides
+    # the loop axes and data order the tile variable corresponds to.
+    indices: list = None
+
+    # tile sizes
+    sizes: list = None
+
+    # set of indices into the tile_loop_indices of the CppTileKernel under which
+    # the tile variable has loop-carried dependency.
+    compute_at: frozenset = None
+
+    # whether the tile variable resides in register
+    in_register: bool = True
+
+    def rank(self):
+        return len(self.indices)
+
+    def variant_indices(self):
+        """
+        Related tiling indices into the tile_loop_indices that this tile variable is variant with.
+        """
+        return set(self.indices) | self.compute_at
+
+
+class CppTileCSEVariable(CSEVariable):
+    """A tile variable that is annotated with a TileMeta attribute"""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.meta = None
+
+
+class CppTile0DOverrides(CppOverrides):
+    """Ops handler for 0-rank (i.e., scalar) tile variable"""
+
+    @staticmethod
+    def load(name: str, index: sympy.Expr):
+        return CppKernel.load(V.kernel, name, index)
+
+    @staticmethod
+    def store(name, index, value, mode=None):
+        CppKernel.store(V.kernel, name, index, value, mode)
+
+    @staticmethod
+    def reduction(name, dtype, src_dtype, reduction_type, index, value):
+        CppKernel.reduction(
+            V.kernel, name, dtype, src_dtype, reduction_type, index, value
+        )
+
+    @staticmethod
+    def tile_slice_load(tile_var, slice_indices):
+        assert isinstance(tile_var, CppTileCSEVariable)
+        assert len(slice_indices) == 0
+
+        if tile_var.meta.rank() == 0:
+            return tile_var
+
+        assert not tile_var.meta.in_register
+        assert tile_var.meta.rank() > 0
+
+        slice = V.kernel.cse.generate(
+            V.kernel.compute,
+            f"{tile_var}[{cexpr(V.kernel.tile_indexing(tile_var.meta, []))}] /* slice load */",
+        )
+        return slice
+
+    @staticmethod
+    def tile_slice_store(tile_var, slice):
+        assert not tile_var.meta.in_register
+        V.kernel.compute.writeline(
+            f"{tile_var}[{cexpr(V.kernel.tile_indexing(tile_var.meta, slice.meta.indices))}] = {slice} /* slice store */;"
+        )
+        return slice
+
+
+class CppTile1DOverrides(CppVecOverrides):
+    """Ops handle for 1D (i.e., vector) tile variable"""
+
+    @staticmethod
+    def _get_vec_tile_idx(index: sympy.Expr):
+        """Check if we can vectorize on current tile index"""
+        self = V.kernel
+        # indirect indexing, do scalar load, otherwise check vectorizable
+        if "tmp" not in f"{index}":
+            # vectorize on loop variable at current tile index if the load is contiguous or invariant
+            indices: set = self.get_indices_from_index(index)
+            current_indices: set = indices - self.current_compute_at
+            assert not current_indices or len(current_indices) == 1, current_indices
+            if current_indices:
+                current_tile_index = next(iter(current_indices))
+                loop_var = self.itervars[self.tile_loop_indices[current_tile_index]]
+                if self.is_stride1_at(loop_var, index):
+                    return current_tile_index
+            else:
+                invariant_indices = self.current_tile_indices() - current_indices
+                assert invariant_indices
+                return next(iter(invariant_indices))
+        return -1
+
+    @staticmethod
+    def load(name: str, index: sympy.Expr):
+        self = V.kernel
+        vec_tile_idx = CppTile1DOverrides._get_vec_tile_idx(index)
+        if vec_tile_idx < 0:
+            raise NotImplementedError
+
         var = self.args.input(name)
         index = self.rename_indexing(index)
 
+        itervar_idx = self.tile_loop_indices[vec_tile_idx]
+        tiling_factor = self.tile_sizes[vec_tile_idx]
+
         expanded_index = sympy.expand(index)
         new_index = self.scale_index_with_offset(
-            index, self.tiling_factor, itervar_idx=self.vec_itervar_idx
+            index, tiling_factor, itervar_idx=itervar_idx
         )
 
         is_broadcast = expanded_index == new_index
@@ -1159,15 +1263,25 @@ class CppVecKernel(CppKernel):
 
         return self.cse.generate(self.loads, line)
 
-    def store(self, name, index, value, mode=None):
+    @staticmethod
+    def store(name, index, value, mode=None):
+        self = V.kernel
+        vec_tile_idx = CppTile1DOverrides._get_vec_tile_idx(index)
+        if vec_tile_idx < 0:
+            raise NotImplementedError
+
+        assert value.meta.rank() == 1
         assert "buf" in name
         var = self.args.output(name)
         index = self.rename_indexing(index)
         assert mode is None
 
+        itervar_idx = self.tile_loop_indices[vec_tile_idx]
+        tiling_factor = self.tile_sizes[vec_tile_idx]
+
         expanded_index = sympy.expand(index)
         new_index = self.scale_index_with_offset(
-            index, self.tiling_factor, itervar_idx=self.vec_itervar_idx
+            index, tiling_factor, itervar_idx=itervar_idx
         )
         assert new_index != expanded_index
         if V.graph.get_dtype(name) in [torch.bfloat16]:
@@ -1176,7 +1290,14 @@ class CppVecKernel(CppKernel):
             line = f"{value}.store({var} + {cexpr(new_index)});"
         self.stores.writeline(name, line)
 
-    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+    @staticmethod
+    def reduction(name, dtype, src_dtype, reduction_type, index, value):
+        self = V.kernel
+        vec_tile_idx = CppTile1DOverrides._get_vec_tile_idx(index)
+        if vec_tile_idx < 0:
+            raise NotImplementedError
+
+        assert value.meta.rank() == 1
         assert reduction_type in {"max", "min", "sum"}
         assert dtype == torch.float
         assert src_dtype == torch.float
@@ -1236,152 +1357,6 @@ class CppVecKernel(CppKernel):
         # the stores there.
         self.cse.store_cache[name] = tmpvar
 
-
-@dataclasses.dataclass
-class TileMeta:
-    """
-    Metadata describing an N-dim tile variable of fixed sizes.
-    Tile variables are valid within the scope of CppTileKernel. The tile
-    variable defines the dim mapping from `indices` attribute to the
-    `CppTileKernel.tile_loop_indices` indicating the kernel itervars to apply tiling.
-    """
-
-    dtype: torch.dtype = torch.float32
-
-    # indices into tile_loop_indices of the CppTileKernel. This decides
-    # the loop axes and data order the tile variable corresponds to.
-    indices: list = None
-
-    # tile sizes
-    sizes: list = None
-
-    # set of indices into the tile_loop_indices of the CppTileKernel under which
-    # the tile variable has loop-carried dependency.
-    compute_at: frozenset = None
-
-    # whether the tile variable resides in register
-    in_register: bool = True
-
-    def rank(self):
-        return len(self.indices)
-
-    def variant_indices(self):
-        """
-        Related tiling indices into the tile_loop_indices that this tile variable is variant with.
-        """
-        return set(self.indices) | self.compute_at
-
-
-class CppTileCSEVariable(CSEVariable):
-    """A tile variable that is annotated with a TileMeta attribute"""
-
-    def __init__(self, name):
-        super().__init__(name)
-        self.meta = None
-
-
-class CppTile0DOverrides(CppOverrides):
-    """Ops handler for 0-rank (i.e., scalar) tile variable"""
-
-    @staticmethod
-    def load(name: str, index: sympy.Expr):
-        return CppKernel.load(V.kernel, name, index)
-
-    @staticmethod
-    def store(name, index, value, mode=None):
-        value = V.kernel.get_tile_slice(value)
-        CppKernel.store(V.kernel, name, index, value, mode)
-
-    @staticmethod
-    def reduction(name, dtype, src_dtype, reduction_type, index, value):
-        value = V.kernel.get_tile_slice(value)
-        CppKernel.reduction(
-            V.kernel, name, dtype, src_dtype, reduction_type, index, value
-        )
-
-    @staticmethod
-    def tile_slice_load(tile_var, slice_indices):
-        assert isinstance(tile_var, CppTileCSEVariable)
-        assert len(slice_indices) == 0
-
-        if tile_var.meta.rank() == 0:
-            return tile_var
-
-        assert not tile_var.meta.in_register
-        assert tile_var.meta.rank() > 0
-
-        slice = V.kernel.cse.generate(
-            V.kernel.compute,
-            f"{tile_var}[{cexpr(V.kernel.tile_indexing(tile_var.meta, []))}] /* slice load */",
-        )
-        return slice
-
-    @staticmethod
-    def tile_slice_store(tile_var, slice):
-        assert not tile_var.meta.in_register
-        V.kernel.compute.writeline(
-            f"{tile_var}[{cexpr(V.kernel.tile_indexing(tile_var.meta, slice.meta.indices))}] = {slice} /* slice store */;"
-        )
-        return slice
-
-
-class CppTile1DOverrides(CppVecOverrides):
-    """Ops handle for 1D (i.e., vector) tile variable"""
-
-    @staticmethod
-    def _get_vec_itervar_idx(index: sympy.Expr):
-        """Check if we can vectorize on current tile index"""
-        self = V.kernel
-        # indirect indexing, do scalar load, otherwise check vectorizable
-        if "tmp" not in f"{index}":
-            # vectorize on loop variable at current tile index if the load is contiguous or invariant
-            indices: set = self.get_indices_from_index(index)
-            current_indices: set = indices - self.current_compute_at
-            assert not current_indices or len(current_indices) == 1, current_indices
-            if current_indices:
-                current_tile_index = next(iter(current_indices))
-                loop_var = self.itervars[self.tile_loop_indices[current_tile_index]]
-                if self.is_stride1_at(loop_var, index):
-                    return self.tile_loop_indices[current_tile_index]
-            else:
-                invariant_indices = self.current_tile_indices() - current_indices
-                assert invariant_indices
-                return self.tile_loop_indices[next(iter(invariant_indices))]
-        return -1
-
-    @staticmethod
-    def load(name: str, index: sympy.Expr):
-        self = V.kernel
-        vec_itervar_idx = CppTile1DOverrides._get_vec_itervar_idx(index)
-        if vec_itervar_idx >= 0:
-            self.vec_itervar_idx = vec_itervar_idx
-            return CppVecKernel.load(self, name, index)
-        raise NotImplementedError
-
-    @staticmethod
-    def store(name, index, value, mode=None):
-        self = V.kernel
-        vec_itervar_idx = CppTile1DOverrides._get_vec_itervar_idx(index)
-        if vec_itervar_idx >= 0:
-            self.vec_itervar_idx = vec_itervar_idx
-            value = self.get_tile_slice(value)
-            assert value.meta.rank() == 1
-            return CppVecKernel.store(V.kernel, name, index, value, mode)
-        raise NotImplementedError
-
-    @staticmethod
-    def reduction(name, dtype, src_dtype, reduction_type, index, value):
-        self = V.kernel
-        vec_itervar_idx = CppTile1DOverrides._get_vec_itervar_idx(index)
-        if vec_itervar_idx >= 0:
-            self.vec_itervar_idx = vec_itervar_idx
-            value = self.get_tile_slice(value)
-            assert value.meta.rank() == 1
-            return CppVecKernel.reduction(
-                V.kernel, name, dtype, src_dtype, reduction_type, index, value
-            )
-        raise NotImplementedError
-
     @staticmethod
     def index_expr(expr, dtype):
         opt_ctx: OptimizationContext = get_current_node_opt_ctx()
@@ -1427,7 +1402,7 @@ class CppTile2DOverrides:
     """Ops handle for 2D tile variable"""
 
     @staticmethod
-    def _get_tile2d_itervar_indices(index):
+    def _get_tile2d_indices(index):
         """Check if we can do 2d tiling on current tile indices"""
         self = V.kernel
         # indirect indexing, do scalar load, otherwise check vectorizable
@@ -1453,7 +1428,7 @@ class CppTile2DOverrides:
     @staticmethod
     def load(name: str, index: sympy.Expr):
         self = V.kernel
-        tile_indices = CppTile2DOverrides._get_tile2d_itervar_indices(index)
+        tile_indices = CppTile2DOverrides._get_tile2d_indices(index)
         if not tile_indices:
             raise NotImplementedError
 
@@ -1483,7 +1458,7 @@ class CppTile2DOverrides:
     @staticmethod
     def store(name, index, value, mode=None):
         self = V.kernel
-        tile_indices = CppTile2DOverrides._get_tile2d_itervar_indices(index)
+        tile_indices = CppTile2DOverrides._get_tile2d_indices(index)
         if not tile_indices:
             raise NotImplementedError
 
@@ -1755,13 +1730,17 @@ class CppTileKernel(CppKernel):
         # the line can be removed if the tile buffer is not used
         self.current_slice_store_name = None
 
-        # TODO(jgong5): following attributes will be removed after we move CppVecKernel
-        # code into 1D tile ops handler. Currently 1D tile ops handle invokes CppVeckernel
-        # directly and they are here to get CppVecKernel work.
-        self.tiling_factor = tile_sizes[0]
+        # NOTE(jgong5): Used by vectorized load (CppTile1DOverrides). We load a vector of
+        # bool/int8 as a float vector when it is used for boolean flags. This dict maps the
+        # bool/int8 vec variable to the variable name of its float counterpart. We can
+        # actually use `cse.generate` instead but current reduction logic requires the reduction
+        # variable name matches between the vector kernel and the scalar kernel. Using
+        # `cse.generate` only in the vec kernel would break this constraint.
+        # TODO(jgong5): Remove the variable below and use `cse.generate` instead.
         self.var_vec_buf_map = {}
+
+        # Used for tracking custom omp reduction for vector type
         self.reduction_omp_dec = {}
-        self.vec_itervar_idx = self.tile_loop_indices[-1]
 
         # tile rank -> ops overrides that handle the tile
         self.tile_ops_tbl = {}
@@ -2103,192 +2082,13 @@ class CppTileKernel(CppKernel):
         super().__exit__(*args)
 
 
-class CppTile2DKernel(CppVecKernel):
-    """
-    A vector kernel that handles the 2d tiles with the tile size defined in `tiling_factor` on
-    the inner-most loop level and one of the outer loop level (`outer_tiling_idx`). When the data
-    tile is accessed in a contiguous way from the outer loop axis, a transposition is applied on the
-    tile to make the access contiguous from the inner-most loop axis. Then, the same vectorization
-    logic from its parent `CppVecKernel` is leveraged for load/store/compute. The transposed tile load
-    and store are generated into kernel.preloads and kernel.poststores buffers.
-
-    The loop structure looks like below:
-    for ...
-      for i_outer ...
-        for ...
-          for inner_most ...
-            // generated by CppTile2DKernel
-            float tmp0[16*16]; at::vec::transpose_mxn<...>(tmp0, in_ptr0 + ..., ...); // into kernel.preloads
-            float tmp1[16*16]; // into kernel.preloads
-            for i_inner ... { // the kernel inner loop
-              vectorized loads/compute/stores (e.g., load tmp0, store tmp1) // into kernel.loads/compute/stores
-            }
-            at::vec::transpose_mxn(out_ptr0 + ..., tmp1, ...) // into kernel.poststores
-          for inner_most ... (tail)
-            // generated by CppTile2DTailKernel
-            ...
-      for i_outer ... (tail)
-        for ...
-          for ...
-            // generated by CppKernel
-            ...
-    """
-
-    def __init__(self, args, num_threads, tiling_factor, outer_tiling_idx):
-        super().__init__(args, num_threads, tiling_factor)
-        self.outer_tiling_idx = outer_tiling_idx
-
-    def inner_itervar(self):
-        return sympy.symbols(f"{self.itervars[self.outer_tiling_idx]}_inner")
-
-    def need_vec_transpose(self, index):
-        return self.is_stride1_at(
-            self.itervars[self.outer_tiling_idx], index
-        ) and not self.is_invariant_under(self.itervars[-1], index)
-
-    def gen_transposed_tile_load_store(self, name, var, index, is_store):
-        # transposed tile load/store outside the kernel inner loop
-        factor = self.tiling_factor
-        new_index = self.scale_index_with_offset(index, factor, itervar_idx=-1)
-        new_index = self.scale_index_with_offset(
-            new_index, factor, itervar_idx=self.outer_tiling_idx
-        )
-
-        src = f"{var} + {cexpr(new_index)}"
-        dst = "__place_holder__"
-        ld_src = f"{cexpr(self.stride_at(self.itervars[-1], index))}"
-        ld_dst = f"{factor}"
-        if is_store:
-            src, dst = dst, src
-            ld_src, ld_dst = ld_dst, ld_src
-
-        need_define = True
-        load_or_store = f"at::vec::transpose_mxn<float,{factor},{factor}>({src}, {ld_src}, {dst}, {ld_dst});"
-        if is_store:
-            tile_var = self.cse.newvar()
-        elif load_or_store not in self.cse.cache:
-            tile_var = self.cse.generate(self.preloads, load_or_store, write=False)
-        else:
-            need_define = False
-            tile_var = self.cse.cache[load_or_store]
-
-        if need_define:
-            define_line = f"float {tile_var}[{factor}*{factor}] __attribute__ ((aligned ({factor})));"
-            self.preloads.writeline(define_line)
-
-        load_or_store = load_or_store.replace("__place_holder__", str(tile_var))
-        if is_store:
-            self.poststores.writeline(name, load_or_store)
-        else:
-            self.preloads.writeline(load_or_store)
-
-        return tile_var
-
-    def load(self, name: str, index: sympy.Expr):
-        var = self.args.input(name)
-        index = self.rename_indexing(index)
-
-        inner = self.inner_itervar()
-        expanded_index = sympy.expand(index)
-        if self.need_vec_transpose(expanded_index):
-            tile_var = self.gen_transposed_tile_load_store(
-                name, var, expanded_index, is_store=False
-            )
-            # vector load inside the kernel inner loop
-            line = f"at::vec::Vectorized<float>::loadu({tile_var} + {cexpr(inner * self.tiling_factor)})"
-            return self.cse.generate(self.loads, line)
-        else:
-            new_index = self.scale_index_with_offset(
-                expanded_index,
-                self.tiling_factor,
-                itervar_idx=self.outer_tiling_idx,
-                offset=inner,
-            )
-            return super().load(name, new_index)
-
-    def store(self, name, index, value, mode=None):
-        assert "buf" in name
-        var = self.args.output(name)
-
-        inner = self.inner_itervar()
-        index = self.rename_indexing(index)
-        assert mode is None
-        # TODO(jgong5): assert the index is an affine expression on the itervars in concern
-        expanded_index = sympy.expand(index)
-        if self.need_vec_transpose(expanded_index):
-            tile_var = self.gen_transposed_tile_load_store(
-                name, var, expanded_index, is_store=True
-            )
-            # vector store inside the kernel inner loop
-            line = f"{value}.store({tile_var} + {cexpr(inner * self.tiling_factor)});"
-            self.stores.writeline(name, line)
-        else:
-            new_index = self.scale_index_with_offset(
-                expanded_index,
-                self.tiling_factor,
-                itervar_idx=self.outer_tiling_idx,
-                offset=inner,
-            )
-            super().store(name, new_index, value, mode)
-
-    def codegen_inner_loops(self, code):
-        inner = self.inner_itervar()
-        code.writeline(
-            f"for (long {inner} = 0; {inner} < {self.tiling_factor}; {inner}++)"
-        )
-
-
-class CppTile2DTailKernel(CppKernel):
-    """
-    A scalar kernel that handles the tail of inner-most loop split from a 2d tiling. The tile of the outer
-    loop axis is handled with a kernel inner loop (see method `codegen_inner_loops`).
-    """
-
-    def __init__(self, args, num_threads, tiling_factor, outer_tiling_idx):
+class CppVecKernelChecker(CppKernel):
+    def __init__(self, args, num_threads):
         super().__init__(args, num_threads)
-        self.outer_tiling_idx = outer_tiling_idx
-        self.tiling_factor = tiling_factor
-
-    def inner_itervar(self):
-        return sympy.symbols(f"{self.itervars[self.outer_tiling_idx]}_inner")
-
-    def transform_index(self, index):
-        index = self.rename_indexing(index)
-        expanded_index = sympy.expand(index)
-        new_index = self.scale_index_with_offset(
-            expanded_index,
-            self.tiling_factor,
-            itervar_idx=self.outer_tiling_idx,
-            offset=self.inner_itervar(),
-        )
-        return new_index
-
-    def load(self, name: str, index: sympy.Expr):
-        new_index = self.transform_index(index)
-        return super().load(name, new_index)
-
-    def store(self, name, index, value, mode=None):
-        assert "buf" in name
-        var = self.args.output(name)
-        assert mode is None
-        new_index = self.transform_index(index)
-        super().store(name, new_index, value, mode)
-
-    def codegen_inner_loops(self, code):
-        inner = self.inner_itervar()
-        code.writeline(
-            f"for (long {inner} = 0; {inner} < {self.tiling_factor}; {inner}++)"
-        )
-
-
-class CppVecKernelChecker(CppVecKernel):
-    def __init__(self, args, num_threads, tiling_factor):
-        super().__init__(args, num_threads, tiling_factor)
 
         # Since this kernel is only for checker but does not generate any
         # code, so we need to decrease the kernel count.
         metrics.generated_kernel_count -= 1
-        metrics.generated_cpp_vec_kernel_count -= 1
 
         # Used to record the graph wrapper code as the wrapper_code status could be
         # changed during graph run.
@@ -2813,8 +2613,8 @@ class CppTile2DKernelChecker(CppVecKernelChecker):
     3. No reduction.
     """
 
-    def __init__(self, args, num_threads, tiling_factor):
-        super().__init__(args, num_threads, tiling_factor)
+    def __init__(self, args, num_threads):
+        super().__init__(args, num_threads)
         self.can_tile2d = True
         self.outer_tiling_idx = -1
 
@@ -3065,12 +2865,12 @@ class CppKernelProxy(CppKernel):
         # config.inplace_buffers. In the future, we could maintain more contexts.
         with torch._inductor.config.patch(inplace_buffers=False):
             with CppVecKernelChecker(
-                deepcopy(self.kernel_group.args), parallel_num_threads(), tiling_factor
+                deepcopy(self.kernel_group.args), parallel_num_threads()
             ) as vec_checker:
                 run(vec_checker)
 
             with CppTile2DKernelChecker(
-                deepcopy(self.kernel_group.args), parallel_num_threads(), tiling_factor
+                deepcopy(self.kernel_group.args), parallel_num_threads()
             ) as tile2d_checker:
                 run(tile2d_checker)
 
