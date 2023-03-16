@@ -1143,6 +1143,8 @@ class TileMeta:
         """
         return set(self.indices) | self.compute_at
 
+    def reduction_indices(self):
+        return {}
 
 class CppTileCSEVariable(CSEVariable):
     """A tile variable that is annotated with a TileMeta attribute"""
@@ -1478,6 +1480,58 @@ class CppTile2DOverrides:
 
         store_line = f"at::vec::transpose_mxn<float,{tile_sizes[1]},{tile_sizes[0]}>(&{src}[0], {ld_src}, {dst}, {ld_dst});"
         self.stores.writeline(name, store_line)
+
+    @staticmethod
+    def mul(a, b):
+        self = V.kernel
+
+        def is_reduction(i):
+            return V.kernel.tile_loop_indices[i] >= V.kernel.reduction_depth
+        
+        if a.meta.rank() != 2 or a.meta.rank() != b.meta.rank() or a.meta.dtype != b.meta.dtype:
+            raise NotImplementedError
+        
+        reduction_indices = a.meta.reduction_indices()
+        if len(reduction_indices) != 1 or reduction_indices != b.meta.reduction_indices():
+            raise NotImplementedError
+            
+        dtype = a.meta.dtype
+        if a.meta.indices[0] in reduction_indices:
+            trans_a = True
+            K = a.meta.sizes[0]
+            M = a.meta.sizes[1]
+            lda = M
+            c_indices_0 = a.meta.indices[1]
+        elif a.meta.indices[1] in reduction_indices:
+            trans_a = False
+            M = a.meta.sizes[0]
+            K = a.meta.sizes[1]
+            lda = K
+            c_indices_0 = a.meta.indices[0]
+
+        if b.meta.indices[0] in reduction_indices:
+            trans_b = False
+            N = b.meta.sizes[1]
+            ldb = N
+            c_indices_1 = b.meta.indices[1]
+        elif b.meta.indices[1] in reduction_indices:
+            trans_b = True
+            N = b.meta.sizes[0]
+            ldb = K
+            c_indices_1 = b.meta.indices[0]
+
+        if c_indices_0 == c_indices_1:
+            raise NotImplementedError
+
+        ldc = N
+        c = self.cse.generate(
+            self.compute,
+            f"([&]() {{ __at_align__ std::array<{dtype},{M*N}> tmp; memset(&tmp[0], 0, sizeof(tmp)); "
+            f"dot<{dtype},{dtype},{M},{N},{K}>(&{a}[0], &{b}[0], &tmp[0], {trans_a}, {trans_b}, {lda}, {ldb}, {ldc}); "
+            f"return tmp; }})()"
+        )
+        c.meta = TileMeta(dtype, [c_indices_0, c_indices_1], [M, N], self.current_compute_at, in_register=False)
+        return c
 
     @staticmethod
     def tile_slice_load(tile_var, slice_indices):
@@ -2848,22 +2902,9 @@ class CppKernelProxy(CppKernel):
                     with kernel.write_to_suffix():
                         node.run(vars, ())
 
-        scalar_kernel = codegen_kernel(CppKernel)
-        inner_most_idx = len(scalar_kernel.itervars) - 1
-        self.call_ranges = scalar_kernel.call_ranges
-        self.loop_nest = LoopNestWithSplit.build(scalar_kernel)
-
-        if not self.picked_vec_isa:
-            return
-
-        # TODO(jgong5): support alternative tiling factors and data types
-        tiling_factor = self.picked_vec_isa.nelements(dtype=torch.float)
-
-        # Kernels share the same global contexts like V.graph.wrapper_code, V.kernel.args.
-        # But the generated scalar kernel has updated these global contexts. Hence, the other kernels
-        # should not do this again to avoid context conflict. By now, we only control the
-        # config.inplace_buffers. In the future, we could maintain more contexts.
-        with torch._inductor.config.patch(inplace_buffers=False):
+        def decide_tiling():
+            # TODO(jgong5): support alternative tiling factors and data types
+            tiling_factor = self.picked_vec_isa.nelements(dtype=torch.float)
             with CppVecKernelChecker(
                 deepcopy(self.kernel_group.args), parallel_num_threads()
             ) as vec_checker:
@@ -2875,41 +2916,51 @@ class CppKernelProxy(CppKernel):
                 run(tile2d_checker)
 
             if vec_checker.simd_vec:
-                main_loop, tail_loop = self.loop_nest.split_with_tiling(
-                    inner_most_idx, factor=tiling_factor
-                )
-                main_loop.set_kernel(
-                    codegen_kernel(CppTileKernel, [tiling_factor], [inner_most_idx])
-                )
-                tail_loop.set_kernel(scalar_kernel)
-                main_loop.simd_vec = True
-                tail_loop.simd_omp = True
-                # We chop the loop into two cubes by the nelements - main loop and tail loop.
-                # Regarding the main loop, it is straightforward that it could be vectorized with
-                # nelements. But for the tail loop, it still could be vectorized. For example,
-                # if the nelements is 8(256bits), then the tail loop still could be vectorized
-                # as 4(128bits).
-                tail_loop.simd_nelements = tiling_factor // 2
+                return [tiling_factor], [self.inner_most_idx]
             elif tile2d_checker.can_tile2d:
-                outer_tiling_idx = tile2d_checker.outer_tiling_idx
-                assert outer_tiling_idx < inner_most_idx
-                outer_main_loop, outer_tail_loop = self.loop_nest.split_with_tiling(
-                    outer_tiling_idx, factor=tiling_factor
-                )
-                outer_tail_loop.set_kernel(scalar_kernel)
-                inner_main_loop, inner_tail_loop = outer_main_loop.split_with_tiling(
-                    inner_most_idx - outer_tiling_idx, factor=tiling_factor
-                )
-                inner_main_loop.set_kernel(
-                    codegen_kernel(
-                        CppTileKernel,
-                        [tiling_factor, tiling_factor],
-                        [outer_tiling_idx, inner_most_idx],
+                return [tiling_factor, tiling_factor], [tile2d_checker.outer_tiling_idx, self.inner_most_idx]
+            return [],[]
+
+        def tile_loops(loops, sizes, depths, pre_sizes, loop_indices):
+            if not sizes:
+                assert len(pre_sizes) == len(loop_indices)
+                if pre_sizes:
+                    loops.set_kernel(
+                        codegen_kernel(CppTileKernel, pre_sizes, loop_indices)
                     )
-                )
-                inner_tail_loop.set_kernel(
-                    codegen_kernel(CppTileKernel, [tiling_factor], [outer_tiling_idx])
-                )
+                else:
+                    loops.set_kernel(
+                        codegen_kernel(CppKernel)
+                    )
+                    # For the tail loop, we reply on omp simd to vectorize it with half of the HW
+                    # vec length. For example, if the nelements is 8(256bits), then the tail loop still
+                    # could be vectorized as 4(128bits).
+                    loops.simd_omp = True
+                    loops.simd_nelements = self.picked_vec_isa.nelements(dtype=torch.float) // 2
+                return
+            
+            main_loop, tail_loop = loops.split_with_tiling(
+                depths[0], factor=sizes[0]
+            )
+            new_depths = [i - depths[0] for i in depths[1:]]
+            tile_loops(main_loop, sizes[1:], new_depths, pre_sizes + [sizes[0]], loop_indices + [loops.get_depth() + depths[0]])
+            tile_loops(tail_loop, sizes[1:], new_depths, pre_sizes, loop_indices)
+
+        scalar_kernel = codegen_kernel(CppKernel)
+        self.inner_most_idx = len(scalar_kernel.itervars) - 1
+        self.call_ranges = scalar_kernel.call_ranges
+        self.loop_nest = LoopNestWithSplit.build(scalar_kernel)
+
+        if not self.picked_vec_isa:
+            return
+
+        # Kernels share the same global contexts like V.graph.wrapper_code, V.kernel.args.
+        # But the generated scalar kernel has updated these global contexts. Hence, the other kernels
+        # should not do this again to avoid context conflict. By now, we only control the
+        # config.inplace_buffers. In the future, we could maintain more contexts.
+        with torch._inductor.config.patch(inplace_buffers=False):
+            tile_sizes, tile_loop_indices = decide_tiling()
+            tile_loops(self.loop_nest, tile_sizes, tile_loop_indices, [], [])
 
     def codegen_loops(self, code, worksharing):
         self.codegen_loops_impl(self.loop_nest, code, worksharing)
@@ -3100,6 +3151,14 @@ class LoopLevel:
     # kernel assigned to this loop level, only valid when it is a leaf
     kernel: CppKernel = None
 
+    def get_depth(self):
+        depth = 0
+        parent = self.parent
+        while parent is not None:
+            parent = parent.parent
+            depth += 1
+        return depth
+
     def get_kernels(self) -> List[CppKernel]:
         """Get all kernel objects under this loop level"""
         if self.kernel:
@@ -3271,6 +3330,16 @@ class LoopNestWithSplit:
 
     def __bool__(self):
         return bool(self.root)
+
+    def get_depth(self):
+        return 0
+
+    def set_kernel(self, kernel):
+        if not self.root:
+            self.kernel = kernel
+        else:
+            assert len(self.root) == 1
+            self.root[0].set_kernel(kernel)
 
     def get_loops_at(self, depth) -> List[LoopLevel]:
         """Get all the loop levels at the given `depth` (most outer loop has depth 0)"""

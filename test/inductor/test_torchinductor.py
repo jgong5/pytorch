@@ -6486,6 +6486,17 @@ if HAS_CPU:
                     )
                     self.assertFalse(vec_checker.simd_vec)
 
+        def test_single_matmul(self):
+            def fn(x: torch.Tensor, y: torch.Tensor):
+                #return aten.gelu(torch.matmul(torch.softmax(x / 10 + 10, -1), y))
+                return torch.matmul(x, y)
+
+            x = torch.randn(64, 128)
+            #y = torch.randn(128, 256).as_strided([128, 256], [1, 128])
+            y = torch.randn(128, 256)
+            compiled_fn = torch.compile(fn)
+            compiled_fn(x, y)
+
         @unittest.skipIf(
             not codecache.valid_vec_isa_list(), "Does not support vectorization"
         )
@@ -6712,7 +6723,7 @@ if HAS_CPU:
                 traced = make_fx(fn)(x1, x2)
                 compiled = compile_fx_inner(traced, [x1, x2])
                 assert same(fn(x1, x2)[0], compiled([x1, x2])[0], equal_nan=True)
-                assert metrics.generated_cpp_vec_kernel_count == 2
+                assert metrics.generated_cpp_vec_kernel_count == 3
 
                 torch._dynamo.reset()
                 metrics.reset()
@@ -6768,7 +6779,7 @@ if HAS_CPU:
                     opt_fn = torch._dynamo.optimize("inductor")(channel_shuffle)
                     same(channel_shuffle(x, 2), opt_fn(x, 2))
                     if simdlen != 1:
-                        assert metrics.generated_cpp_vec_kernel_count == 2
+                        assert metrics.generated_cpp_vec_kernel_count == 3
 
         @slow()
         @unittest.skipIf(
@@ -6835,7 +6846,7 @@ if HAS_CPU:
                         opt_fn = torch._dynamo.optimize("inductor")(fn)
                         same(fn(x), opt_fn(x))
                         if simdlen != 1:
-                            assert metrics.generated_cpp_vec_kernel_count == 2
+                            assert metrics.generated_cpp_vec_kernel_count == 3
 
         def test_transpose_non_contiguous(self):
             def fn(a):

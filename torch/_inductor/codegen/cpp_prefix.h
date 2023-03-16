@@ -141,3 +141,23 @@ inline at::vec::Vectorized<float> to_float_mask(at::vec::Vectorized<float> src) 
   return src;
 }
 #endif
+
+template<typename IN, typename OUT, long M, long N, long K>
+void dot(
+  const IN* A,
+  const IN* B,
+  OUT* C,
+  bool trans_a,
+  bool trans_b,
+  int lda, int ldb, int ldc
+) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < K; k++) {
+                int offset_a = trans_a ? m + k * lda : m * lda + k;
+                int offset_b = trans_b ? k + n * ldb : k * ldb + n;
+                C[m * ldc + n] += A[offset_a] * B[offset_b];
+            }
+        }
+    }
+}
