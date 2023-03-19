@@ -13,6 +13,7 @@ import numpy
 import sympy
 
 import torch
+from torch._inductor.debug import create_fx_from_snodes
 import torch.fx
 from torch._prims_common import is_float_dtype
 
@@ -1146,6 +1147,7 @@ class TileMeta:
     def reduction_indices(self):
         return {}
 
+
 class CppTileCSEVariable(CSEVariable):
     """A tile variable that is annotated with a TileMeta attribute"""
 
@@ -1487,14 +1489,21 @@ class CppTile2DOverrides:
 
         def is_reduction(i):
             return V.kernel.tile_loop_indices[i] >= V.kernel.reduction_depth
-        
-        if a.meta.rank() != 2 or a.meta.rank() != b.meta.rank() or a.meta.dtype != b.meta.dtype:
+
+        if (
+            a.meta.rank() != 2
+            or a.meta.rank() != b.meta.rank()
+            or a.meta.dtype != b.meta.dtype
+        ):
             raise NotImplementedError
-        
+
         reduction_indices = a.meta.reduction_indices()
-        if len(reduction_indices) != 1 or reduction_indices != b.meta.reduction_indices():
+        if (
+            len(reduction_indices) != 1
+            or reduction_indices != b.meta.reduction_indices()
+        ):
             raise NotImplementedError
-            
+
         dtype = a.meta.dtype
         if a.meta.indices[0] in reduction_indices:
             trans_a = True
@@ -1528,9 +1537,15 @@ class CppTile2DOverrides:
             self.compute,
             f"([&]() {{ __at_align__ std::array<{dtype},{M*N}> tmp; memset(&tmp[0], 0, sizeof(tmp)); "
             f"dot<{dtype},{dtype},{M},{N},{K}>(&{a}[0], &{b}[0], &tmp[0], {trans_a}, {trans_b}, {lda}, {ldb}, {ldc}); "
-            f"return tmp; }})()"
+            f"return tmp; }})()",
         )
-        c.meta = TileMeta(dtype, [c_indices_0, c_indices_1], [M, N], self.current_compute_at, in_register=False)
+        c.meta = TileMeta(
+            dtype,
+            [c_indices_0, c_indices_1],
+            [M, N],
+            self.current_compute_at,
+            in_register=False,
+        )
         return c
 
     @staticmethod
@@ -2918,8 +2933,11 @@ class CppKernelProxy(CppKernel):
             if vec_checker.simd_vec:
                 return [tiling_factor], [self.inner_most_idx]
             elif tile2d_checker.can_tile2d:
-                return [tiling_factor, tiling_factor], [tile2d_checker.outer_tiling_idx, self.inner_most_idx]
-            return [],[]
+                return [tiling_factor, tiling_factor], [
+                    tile2d_checker.outer_tiling_idx,
+                    self.inner_most_idx,
+                ]
+            return [], []
 
         def tile_loops(loops, sizes, depths, pre_sizes, loop_indices):
             if not sizes:
@@ -2929,21 +2947,25 @@ class CppKernelProxy(CppKernel):
                         codegen_kernel(CppTileKernel, pre_sizes, loop_indices)
                     )
                 else:
-                    loops.set_kernel(
-                        codegen_kernel(CppKernel)
-                    )
+                    loops.set_kernel(codegen_kernel(CppKernel))
                     # For the tail loop, we reply on omp simd to vectorize it with half of the HW
                     # vec length. For example, if the nelements is 8(256bits), then the tail loop still
                     # could be vectorized as 4(128bits).
                     loops.simd_omp = True
-                    loops.simd_nelements = self.picked_vec_isa.nelements(dtype=torch.float) // 2
+                    loops.simd_nelements = (
+                        self.picked_vec_isa.nelements(dtype=torch.float) // 2
+                    )
                 return
-            
-            main_loop, tail_loop = loops.split_with_tiling(
-                depths[0], factor=sizes[0]
-            )
+
+            main_loop, tail_loop = loops.split_with_tiling(depths[0], factor=sizes[0])
             new_depths = [i - depths[0] for i in depths[1:]]
-            tile_loops(main_loop, sizes[1:], new_depths, pre_sizes + [sizes[0]], loop_indices + [loops.get_depth() + depths[0]])
+            tile_loops(
+                main_loop,
+                sizes[1:],
+                new_depths,
+                pre_sizes + [sizes[0]],
+                loop_indices + [loops.get_depth() + depths[0]],
+            )
             tile_loops(tail_loop, sizes[1:], new_depths, pre_sizes, loop_indices)
 
         scalar_kernel = codegen_kernel(CppKernel)
@@ -2961,6 +2983,19 @@ class CppKernelProxy(CppKernel):
         with torch._inductor.config.patch(inplace_buffers=False):
             tile_sizes, tile_loop_indices = decide_tiling()
             tile_loops(self.loop_nest, tile_sizes, tile_loop_indices, [], [])
+
+            if schedule_log.isEnabledFor(logging.DEBUG):
+                if not tile_sizes:
+                    schedule_log.debug("Scalar kernel:")
+                    for node in nodes:
+                        schedule_log.debug(node.debug_str_extra())
+                    code = BracesBuffer()
+                    self.codegen_loops(code, WorkSharing(code))
+                    schedule_log.debug(code.getvalue())
+                elif len(tile_sizes) == 1:
+                    schedule_log.debug("Vectorized kernel:")
+                else:
+                    schedule_log.debug("Tile2D kernel:")
 
     def codegen_loops(self, code, worksharing):
         self.codegen_loops_impl(self.loop_nest, code, worksharing)
@@ -3333,6 +3368,12 @@ class LoopNestWithSplit:
 
     def get_depth(self):
         return 0
+
+    def get_kernels(self) -> List[CppKernel]:
+        if not self.root:
+            return [self.kernel]
+        else:
+            return [kernel for loops in self.root for kernel in loops.get_kernels()]
 
     def set_kernel(self, kernel):
         if not self.root:
