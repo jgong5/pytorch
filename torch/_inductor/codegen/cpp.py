@@ -1155,7 +1155,17 @@ class CppVecKernel(CppKernel):
         elif is_broadcast:
             line = f"at::vec::Vectorized<float>({var_expr})"
         else:
-            line = f"at::vec::Vectorized<float>::loadu({var_expr})"
+            most_inner_var = self.itervars[-1]
+            if config.cpp.use_tile2d or self.is_stride1_at(most_inner_var, new_index):
+                line = f"at::vec::Vectorized<float>::loadu({var_expr})"
+            else:
+                inner = sympy.symbols(f"{self.itervars[-1]}_inner")
+                new_index = self.scale_index_with_offset(index, self.tiling_factor, offset=inner)
+                line = (
+                    f"([&]() {{ __at_align__ float tmp_buf[{self.tiling_factor}]; "
+                    f"for (long {inner} = 0; {inner} < {self.tiling_factor}; {inner}++) tmp_buf[{inner}] = {var}[{cexpr(new_index)}]; "
+                    "return at::vec::Vectorized<float>::loadu(tmp_buf); })()"
+                )
 
         return self.cse.generate(self.loads, line)
 
@@ -1171,7 +1181,16 @@ class CppVecKernel(CppKernel):
         if V.graph.get_dtype(name) in [torch.bfloat16]:
             line = f"store_float_as_bf16({var} + {cexpr(new_index)}, {value});"
         else:
-            line = f"{value}.store({var} + {cexpr(new_index)});"
+            most_inner_var = self.itervars[-1]
+            if config.cpp.use_tile2d or self.is_stride1_at(most_inner_var, new_index):
+                line = f"{value}.store({var} + {cexpr(new_index)});"
+            else:
+                inner = sympy.symbols(f"{self.itervars[-1]}_inner")
+                new_index = self.scale_index_with_offset(index, self.tiling_factor, offset=inner)
+                line = (
+                    f"{{ __at_align__ float tmp_buf[{self.tiling_factor}]; {value}.store(tmp_buf); "
+                    f"for (long {inner} = 0; {inner} < {self.tiling_factor}; {inner}++) {var}[{cexpr(new_index)}] = tmp_buf[{inner}]; }}"
+                )
         self.stores.writeline(name, line)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
@@ -1469,10 +1488,13 @@ class CppVecKernelChecker(CppVecKernel):
         if self.is_indirect_indexing(index):
             return False
 
-        most_inner_var = self.itervars[-1]
-        return self.is_invariant_under(most_inner_var, index) or self.is_stride1_at(
-            most_inner_var, index
-        )
+        if config.cpp.use_tile2d:
+            most_inner_var = self.itervars[-1]
+            return self.is_invariant_under(most_inner_var, index) or self.is_stride1_at(
+                most_inner_var, index
+            )
+        else:
+            return True
 
     def is_mask(self, name: str, users: Dict[torch.fx.Node, None]):
         load_type = V.graph.get_dtype(name)
