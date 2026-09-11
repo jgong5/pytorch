@@ -38,19 +38,19 @@ def lds_capacity() -> int:
     return _LDS_CAPACITY.get(get_rocm_arch(), 65536)
 
 
-# TODO: Move common ROCm synchronization and buffer-load helpers to FlyDSL.
 def barrier(vmcnt=0):
-    llvm.InlineAsmOp(
-        None,
-        [],
-        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
-        "",
-        has_side_effects=True,
-    )
+    """Drain to `vmcnt` outstanding VMEM loads, then join the workgroup.
+
+    Matches FlyDSL's own gfx950 GEMM (`wait_vmcnt_and_barrier`): the typed
+    intrinsics carry the same side effects as the equivalent inline-asm block,
+    so nothing can be scheduled between them.
+    """
+    rocdl.s_waitcnt(vmcnt=vmcnt)
+    rocdl.s_barrier()
 
 
 def waitcnt(vmcnt=0):
-    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})", "", has_side_effects=True)
+    rocdl.s_waitcnt(vmcnt=vmcnt)
 
 
 def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, dma_bytes):
