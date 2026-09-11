@@ -9,14 +9,16 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
 from .gemm_gfx950 import (
-    __barrier,
-    __waitcnt,
     _elem_dtype,
     _make_gemm_gfx950_tiled_mma,
-    BlockSwizzle,
-    buffer_load_lds_inline,
     GEMM_DTYPE_FP16,
     GemmGfx950Param,
+)
+from .gfx950_common import (
+    barrier,
+    BlockSwizzle,
+    buffer_load_lds_inline,
+    waitcnt,
 )
 from .grouped_gemm_gfx950_config import GFX950_DMA_BYTES, GFX950_WAVE_SIZE
 
@@ -475,7 +477,7 @@ def gemm_gfx950_grouped_kernel(
         for k_tile in range(0, main_loop_end, 1):
             current_stage = k_tile % stages
             write_stage = (current_stage + stages - 1) % stages
-            __barrier((stages - 2) * ldg_wait_count)
+            barrier((stages - 2) * ldg_wait_count)
             _grouped_load_b_tile_async(
                 ctx, bid_n, n, k, g, k_tile + (stages - 1), write_stage
             )
@@ -485,7 +487,7 @@ def gemm_gfx950_grouped_kernel(
             _grouped_compute_stage_from_lds(ctx, current_stage, k_tile, k)
         current_stage = main_loop_end % stages
         for s in range_constexpr(0, stages - 1):
-            __barrier((stages - 2 - s) * ldg_wait_count)
+            barrier((stages - 2 - s) * ldg_wait_count)
             _grouped_compute_stage_from_lds(ctx, current_stage, main_loop_end + s, k)
             current_stage = (current_stage + 1) % stages
         _grouped_tile_store(ctx, thr_gC)
@@ -786,10 +788,10 @@ def gemm_hti_gfx950_grouped_kernel(
         b0 = load_b_fragment(0, 1, k_tile + 1)
         if const_expr(prefetch_next):
             load_b_half(1, next_k_tile, 0, bid_n, group)
-            __barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
+            barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(k_tile, c11, a1, b1)
         if const_expr(not prefetch_next):
-            __waitcnt(0)
+            waitcnt(0)
         rocdl.s_barrier()
 
         a0 = load_a_fragment(0, 1, k_tile + 1)
@@ -815,7 +817,7 @@ def gemm_hti_gfx950_grouped_kernel(
 
         if const_expr(prefetch_next):
             load_b_half(1, next_k_tile + 1, 1, bid_n, group)
-            __barrier(half_ldg_b_iters + half_ldg_a_iters)
+            barrier(half_ldg_b_iters + half_ldg_a_iters)
         consume(k_tile + 1, c11, a1, b1)
         rocdl.s_barrier()
 
@@ -835,7 +837,7 @@ def gemm_hti_gfx950_grouped_kernel(
         load_b_half(0, 1, 1, bid_n, g)
         load_a_half(0, 1, 1, bid_m, m_g, row_base)
         load_b_half(1, 1, 1, bid_n, g)
-        __barrier(half_ldg_b_iters + half_ldg_a_iters)
+        barrier(half_ldg_b_iters + half_ldg_a_iters)
 
         final_double_tile = ((k_tiles % 2) == 0).select(k_tiles - 2, k_tiles - 1)
         main_loop_end = (k_tiles > 2).select(final_double_tile, 0)

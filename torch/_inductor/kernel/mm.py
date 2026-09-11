@@ -2,7 +2,7 @@
 import functools
 import logging
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from torch._dynamo.utils import counters
@@ -14,6 +14,7 @@ from torch._inductor.autoheuristic.autoheuristic_utils import (
     mm_operations,
 )
 from torch._inductor.codegen.cpp_gemm_template import CppGemmTemplate
+from torch._inductor.heuristics.template.flydsl import MXFPFormat
 from torch._inductor.remote_gemm_autotune_cache import gen_best_config
 from torch._inductor.virtualized import ops, V
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -88,7 +89,6 @@ except ImportError:
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
-MXFPFormat = Literal["mxfp4", "mxfp8"]
 
 # We define each template kernel in a separate file which is the name of the input to load_kernel_template
 # (e.g. triton_mm for templates/triton_mm.py.jinja).
