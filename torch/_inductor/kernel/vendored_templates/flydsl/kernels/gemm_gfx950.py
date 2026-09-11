@@ -23,6 +23,7 @@ from .gfx950_common import (
     make_ab_lds_layouts,
     make_ab_s2r_atoms,
     make_cshuffle_plan,
+    make_gemm_tiled_mma,
     make_kernel_name,
     make_tile_schedule,
     run_staged_pipeline,
@@ -231,25 +232,18 @@ def make_gemm_ab_load_context(elem_dtype, tiled_mma, tid, k, param: GemmGfx950Pa
 
 
 def _make_gemm_gfx950_tiled_mma(param: GemmGfx950Param):
-    mma_atom = fx.make_mma_atom(
-        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, _elem_dtype(param))
-    )
     k_per_mfma_group = param.mma_k // 4
-    return fx.make_tiled_mma(
-        mma_atom,
-        fx.make_layout(
-            (param.m_waves, param.n_waves, 1),
-            (param.n_waves, 1, 0),
-        ),
+    _, tiled_mma = make_gemm_tiled_mma(
+        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, _elem_dtype(param)),
+        param.m_waves,
+        param.n_waves,
         fx.make_tile(
             None,
             None,
-            fx.make_layout(
-                (k_per_mfma_group, 4),
-                (1, k_per_mfma_group),
-            ),
+            fx.make_layout((k_per_mfma_group, 4), (1, k_per_mfma_group)),
         ),
     )
+    return tiled_mma
 
 
 @flyc.kernel
@@ -565,7 +559,6 @@ def gemm_hti_gfx950_kernel(
         is_k_major=not param.b_is_transposed,
         has_outer_tail=True,
     )
-    c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
 
     def half_a_base(stage, m_part):
         return smem_a + (stage * block_m + m_part * half_block_m) * block_k
@@ -677,40 +670,20 @@ def gemm_hti_gfx950_kernel(
         gC = fx.flat_divide(out, (half_block_m, half_block_n))[
             None, None, bid_m * 2 + m_part, bid_n * 2 + n_part
         ]
-        sC = fx.make_view(smem_c, c_lds_layout)
-
-        row_coords = fx.make_view(
-            0, fx.make_layout((half_block_m, half_block_n), (1, 0))
+        cshuffle = make_cshuffle_plan(
+            block_m=half_block_m,
+            block_n=half_block_n,
+            block_threads=block_threads,
+            out_data_bytes=param.out_data_bytes,
+            tid=tid,
+            thr_mma=thr_mma,
+            smem_c=smem_c,
+            gC=gC,
+            s2r_atom=uni_copy_atom,
+            r2g_atom=buffer_copy_atom,
+            want_pred=True,
         )
-        col_coords = fx.make_view(
-            0, fx.make_layout((half_block_m, half_block_n), (0, 1))
-        )
-        thr_mma_cRow = thr_mma.partition_C(row_coords)
-        thr_mma_cCol = thr_mma.partition_C(col_coords)
-
-        cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
-        cshuffle_x_threads = half_block_n // cshuffle_vec_size
-        cshuffle_thr_layout = fx.make_layout(
-            (block_threads // cshuffle_x_threads, cshuffle_x_threads),
-            (cshuffle_x_threads, 1),
-        )
-        cshuffle_val_layout = fx.make_layout((1, cshuffle_vec_size), (1, 1))
-        cshuffle_tile, cshuffle_tv_layout = fx.make_layout_tv(
-            cshuffle_thr_layout,
-            cshuffle_val_layout,
-        )
-        tiled_copy_cshuffle = fx.make_tiled_copy(
-            buffer_copy_atom,
-            cshuffle_tv_layout,
-            cshuffle_tile,
-        )
-        thr_copy_cshuffle = tiled_copy_cshuffle.get_slice(tid)
-        thr_sC = thr_copy_cshuffle.partition_S(sC)
-        thr_gC = thr_copy_cshuffle.partition_D(gC)
-        thr_cRow = thr_copy_cshuffle.partition_S(row_coords)[(0, None), None, None]
-        thr_cCol = thr_copy_cshuffle.partition_S(col_coords)[(0, None), None, None]
-        frag_C_cshuffle = fx.make_fragment_like(thr_sC)
-        pred_C = fx.make_fragment_like(thr_cRow, dtype=fx.Boolean)
+        pred_C, thr_cRow, thr_cCol = cshuffle.pred_C
 
         for i in range_constexpr(fx.size(pred_C.shape).unpack()):
             local_row = fx.get_scalar(thr_cRow[i])
@@ -728,21 +701,13 @@ def gemm_hti_gfx950_kernel(
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             val = frag_C[i]
             if const_expr(param.has_bias):
-                col = fx.get_scalar(thr_mma_cCol[i])
+                col = fx.get_scalar(cshuffle.thr_mma_cCol[i])
                 global_n_idx = bid_n * block_n + n_part * half_block_n + col
                 safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                 val = val + bias_buf[safe_global_n_idx].to(fx.Float32)
             frag_C_out[i] = val.to(elem_dtype)
 
-        fx.gpu.barrier()
-        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-            row = fx.get_scalar(thr_mma_cRow[i])
-            col = fx.get_scalar(thr_mma_cCol[i])
-            sC[row, col] = frag_C_out[i]
-
-        fx.gpu.barrier()
-        fx.copy(uni_copy_atom, thr_sC, frag_C_cshuffle)
-        fx.copy(buffer_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
+        store_c_tile(cshuffle, frag_C_out, pred=pred_C)
         fx.gpu.barrier()
 
     c00 = make_c_fragment(0, 0)

@@ -554,3 +554,17 @@ def make_kernel_name(prefix: str, *, block_m, block_n, block_k, stages, m_waves,
         name += f"_{key}{int(value)}"
     name += f"_l{'t' if a_is_transposed else 'n'}{'t' if b_is_transposed else 'n'}"
     return name
+
+
+def make_gemm_tiled_mma(mma_op, m_waves, n_waves, permutation=None):
+    """Tile one MMA atom over an (m_waves, n_waves) wave grid.
+
+    Returns the atom alongside the tiled MMA because the scaled path issues
+    per-16x16 `fx.gemm` calls against the atom directly, while the unscaled
+    path drives the whole tile through the tiled form.
+    """
+    mma_atom = fx.make_mma_atom(mma_op)
+    wave_layout = fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0))
+    if const_expr(permutation is None):
+        return mma_atom, fx.make_tiled_mma(mma_atom, wave_layout)
+    return mma_atom, fx.make_tiled_mma(mma_atom, wave_layout, permutation)
