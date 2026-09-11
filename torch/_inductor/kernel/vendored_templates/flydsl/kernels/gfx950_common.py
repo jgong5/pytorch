@@ -41,16 +41,25 @@ def lds_capacity() -> int:
 def barrier(vmcnt=0):
     """Drain to `vmcnt` outstanding VMEM loads, then join the workgroup.
 
-    Matches FlyDSL's own gfx950 GEMM (`wait_vmcnt_and_barrier`): the typed
-    intrinsics carry the same side effects as the equivalent inline-asm block,
-    so nothing can be scheduled between them.
+    Deliberately inline asm rather than rocdl.s_waitcnt + rocdl.s_barrier. The
+    staged pipeline's correctness is the exact count: compute on stage s may
+    only start once every load for it has landed, which is expressed as
+    "(stages - 2) * ldg_wait_count loads may still be outstanding". An intrinsic
+    is visible to LLVM's waitcnt insertion pass, which models outstanding memory
+    ops and may merge or relax it; that is usually a win and here it would be a
+    silent correctness change. The asm block reaches the ISA verbatim.
     """
-    rocdl.s_waitcnt(vmcnt=vmcnt)
-    rocdl.s_barrier()
+    llvm.InlineAsmOp(
+        None,
+        [],
+        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
+        "",
+        has_side_effects=True,
+    )
 
 
 def waitcnt(vmcnt=0):
-    rocdl.s_waitcnt(vmcnt=vmcnt)
+    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})", "", has_side_effects=True)
 
 
 def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, dma_bytes):
